@@ -85,6 +85,16 @@ from ._helpers import (
     help="Model for summary (default: per-backend, or MILLET_SUMMARY_MODEL env var)",
 )
 @click.option(
+    "--summary-template",
+    type=str,
+    default=None,
+    help="Summary prompt template name (e.g. 'iteration-plan'). Uses "
+    "summarize_<template>_{system,user}.md from millet/prompts (dashes in "
+    "the name become underscores) and writes "
+    "<base>.<template>.md instead of <base>.summary.md. Also configurable "
+    "via MILLET_SUMMARY_TEMPLATE.",
+)
+@click.option(
     "--ollama-singlepass",
     is_flag=True,
     default=False,
@@ -120,6 +130,7 @@ def run(
     summary_preset,
     summary_backend,
     summary_model,
+    summary_template,
     ollama_singlepass,
     skip_alignment,
     mixdown,
@@ -237,6 +248,7 @@ def run(
                     summary_backend=summary_backend,
                     summary_preset=summary_preset,
                     ollama_singlepass=ollama_singlepass,
+                    summary_template=summary_template,
                 )
             except Exception as exc:
                 # Only raised when summary_preset was set (preset guard).

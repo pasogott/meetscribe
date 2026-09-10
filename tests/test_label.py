@@ -572,6 +572,45 @@ class TestApplyLabelsSummaryLanguage:
         assert not list(session_dir.glob(f"{basename}.summary.??.md"))
 
 
+class TestApplyLabelsSummaryTemplate:
+    """summary_template writes <name>.<template>.md instead of clobbering
+    the primary <name>.summary.md."""
+
+    def _fake_summary(self):
+        from millet.summarize import MeetingSummary
+        return MeetingSummary(
+            markdown="## Overview\nA plan.",
+            backend="test",
+            model="test-model",
+            elapsed_seconds=0.1,
+            template="iteration-plan",
+            data=None,
+            data_error=None,
+        )
+
+    def test_template_writes_own_artifact(self, session_dir):
+        basename = "meeting-20260314-100000"
+        primary = session_dir / f"{basename}.summary.md"
+        primary_before = primary.read_text()
+
+        with patch("millet.summarize.is_backend_available", return_value=True), \
+             patch("millet.summarize.summarize", return_value=self._fake_summary()), \
+             patch("millet.transcribe.ensure_gpu_available", lambda *a, **k: None):
+            result_files = apply_labels(
+                session_dir,
+                {},
+                regenerate_summary=True,
+                summary_template="iteration-plan",
+            )
+
+        plan = session_dir / f"{basename}.iteration-plan.md"
+        assert plan.exists()
+        assert (session_dir / f"{basename}.iteration-plan.meta.json").exists()
+        assert result_files.get("iteration-plan") == plan
+        # Primary summary is untouched.
+        assert primary.read_text() == primary_before
+
+
 # ─── relabel_transcript_in_memory: same-name speaker collapse (0.12.11) ──────
 # Diarization over-segments one person into several clusters; once they resolve
 # to the same name (via many-to-one voiceprint match or a human naming each),
@@ -909,6 +948,21 @@ class TestLabelApplyJson:
         )
         assert result.exit_code == 1
         assert "could not parse" in result.output
+
+    def test_summary_template_forwarded(self, session_dir, tmp_path):
+        """--summary-template must reach apply_labels (vezir retry-summary path)."""
+        payload = tmp_path / "labels.json"
+        payload.write_text(json.dumps({"labels": {}}))
+        with patch("millet.label.apply_labels", return_value={}) as mock_apply:
+            result = self._invoke(
+                [
+                    str(session_dir),
+                    "--apply-json", str(payload),
+                    "--summary-template", "iteration-plan",
+                ]
+            )
+        assert result.exit_code == 0, result.output
+        assert mock_apply.call_args.kwargs["summary_template"] == "iteration-plan"
 
     def test_non_dict_json_exits_nonzero(self, session_dir, tmp_path):
         payload = tmp_path / "labels.json"

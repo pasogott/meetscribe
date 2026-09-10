@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.17.0 — feat: summary templates (`--summary-template`) + `iteration-plan` prompt
+
+### Added
+
+* **`millet/summarize.py`** — summary templates: a named template
+  (e.g. `iteration-plan`) selects its own prompt files
+  (`summarize_<template>_{system,user}.md` under `millet/prompts/`, dashes
+  in the name become underscores) while presets keep selecting
+  backend/model only — the two compose.  Resolution order: explicit
+  `--summary-template` > `MILLET_SUMMARY_TEMPLATE` env > default meeting
+  summary.  Unknown templates fall back to the default prompts; template
+  names are validated (`[a-z0-9][a-z0-9_-]*`) so no path traversal is
+  possible.  A template run forces the single-pass Ollama flow (the
+  two-pass extract/format prompts are meeting-summary-specific) and the
+  template survives fallback-backend config rebuilds.  The
+  `.summary.meta.json`-style sidecar now records `"template"`.
+* **`millet/prompts/summarize_iteration_plan_{system,user}.md`** — new
+  `iteration-plan` template for narrated screen recordings: timestamped
+  Issues (severity + suggested fix), UX Notes, and Went Well, keyed to
+  `[HH:MM:SS]` transcript cues so each item points at a video frame.
+  Keeps the mandatory fenced-JSON contract, so frontmatter parsing is
+  unchanged.
+* **`MeetingSummary.save(..., artifact=)`** — template output is written
+  as `<base>.<template>.md` (plus `.<template>.meta.json` /
+  `.<template>.frontmatter.json` sidecars) instead of clobbering
+  `<base>.summary.md`.
+* **CLI** — `--summary-template` on `millet transcribe`, `millet run`,
+  and `millet label` (including `--apply-json`, the vezir subprocess
+  boundary, so a session uploaded without a template can get the plan
+  later via retry-summary).
+* **`millet/sync.py`** — template artifacts push to the team repo under
+  their own descriptive name (`<base>.iteration-plan.md` →
+  `iteration-plan.md`, previously mis-mapped to `summary.md`), and all
+  `*.meta.json` sidecars are excluded from push (previously only
+  `.summary.meta.json`).
+
+### Tests
+
+* 23 new tests: template prompt resolution + fallback, config validation
+  and env precedence, dispatch routing (template forces single-pass,
+  survives fallback configs), artifact/sidecar naming, end-to-end
+  provenance, `apply_labels` + `--apply-json` forwarding, sync
+  collection.
+
 ## v0.16.1 — fix: Kimi K-series temperature clamp on the openai backend
 
 ### Fixed

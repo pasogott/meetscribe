@@ -164,6 +164,7 @@ MAX_ATTACHMENTS_BYTES = 100 * 1024 * 1024
 EXCLUDE_PATTERNS = {
     ".session.json",
     ".summary.meta.json",
+    ".meta.json",  # summary/template meta sidecars (superset of the above)
     ".autoid.json",
     ".frontmatter.json",
     ".ffmpeg.log",
@@ -680,6 +681,14 @@ def _collect_files(session_dir: Path) -> list[tuple[Path, str]]:
             stem = f.name[: -len(".md")]
             lang = stem.rsplit(".summary.", 1)[-1]
             dest_name = f"summary.{lang}.md" if lang else f.name
+        elif f.name.endswith(".md") and "." in f.name[: -len(".md")]:
+            # Template summary artifact: <base>.<template>.md ->
+            # <template>.md (e.g. iteration-plan.md).  Dotted stray files
+            # get the same treatment — a descriptive name beats summary.md,
+            # which the real summary already owns.
+            stem = f.name[: -len(".md")]
+            tag = stem.rsplit(".", 1)[-1]
+            dest_name = f"{tag}.md" if tag else f.name
         elif f.suffix == ".md":
             dest_name = "summary.md"
         elif f.suffix == ".txt":

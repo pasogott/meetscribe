@@ -160,16 +160,25 @@ def _lang_instruction(language: str | None) -> str:
     )
 
 
-def _build_system_prompt(language: str | None = None) -> str:
-    """Build the system prompt with section headers in the target language."""
+def _build_system_prompt(language: str | None = None, template: str | None = None) -> str:
+    """Build the system prompt with section headers in the target language.
+
+    When ``template`` names a summary template (e.g. ``"iteration-plan"``),
+    ``summarize_<template>_system.md`` is preferred, falling back to the
+    default ``summarize_system.md`` when no such file exists.
+    """
     lang = language or "en"
     h = _SECTION_HEADERS.get(lang, _SECTION_HEADERS["en"])
 
     lang_instruction = _lang_instruction(lang)
 
-    template = _load_prompt("summarize_system.md")
-    if template is not None:
-        return template.format(
+    template_text = None
+    if template:
+        template_text = _load_prompt(f"summarize_{template.replace('-', '_')}_system.md")
+    if template_text is None:
+        template_text = _load_prompt("summarize_system.md")
+    if template_text is not None:
+        return template_text.format(
             overview=h["overview"],
             topics=h["topics"],
             actions=h["actions"],
@@ -226,11 +235,20 @@ Rules:
 - The JSON block: every field is REQUIRED. Use [] for empty lists, null for unknown assignee/due/topic. action_items.status must be one of "open", "closed", "blocked" — default to "open". The JSON content must be in English even when the body is in another language.{lang_instruction}"""
 
 
-def _load_user_prompt_template() -> str:
-    """Load the user prompt template."""
-    template = _load_prompt("summarize_user.md")
-    if template is not None:
-        return template
+def _load_user_prompt_template(template: str | None = None) -> str:
+    """Load the user prompt template.
+
+    When ``template`` names a summary template (e.g. ``"iteration-plan"``),
+    ``summarize_<template>_user.md`` is preferred, falling back to the
+    default ``summarize_user.md`` when no such file exists.
+    """
+    if template:
+        text = _load_prompt(f"summarize_{template.replace('-', '_')}_user.md")
+        if text is not None:
+            return text
+    text = _load_prompt("summarize_user.md")
+    if text is not None:
+        return text
     return "Please summarize the following meeting transcript:\n\n---\n{transcript}\n---"
 
 
@@ -414,6 +432,7 @@ class SummaryConfig:
 
         MILLET_SUMMARY_BACKEND      -> backend  (default: "ollama")
         MILLET_SUMMARY_MODEL        -> model    (default: per-backend)
+        MILLET_SUMMARY_TEMPLATE     -> template (default: None = meeting summary)
         OPENROUTER_API_KEY          -> required for openrouter backend
 
     Operator-level fallback knobs (read at dispatch time, not stored here):
@@ -428,6 +447,7 @@ class SummaryConfig:
     backend: str | None = None  # None = resolve from env/default
     model: str | None = None  # None = resolve from env/default per backend
     preset: str | None = None  # None = no preset; "high-quality"|"confidential"|"alternative"
+    template: str | None = None  # None = default meeting-summary prompts
     ollama_url: str = OLLAMA_BASE_URL
     timeout: int = DEFAULT_TIMEOUT
     temperature: float = 0.3
@@ -443,6 +463,25 @@ class SummaryConfig:
                 "MILLET_SUMMARY_PRESET",
                 "MEETSCRIBE_SUMMARY_PRESET",
             )
+        # Resolve template: explicit arg > env var > None.  Templates select
+        # the prompt files (summarize_<template>_{system,user}.md under
+        # millet/prompts/); presets select backend/model.  They compose.
+        if self.template is None:
+            from .paths import getenv_renamed
+
+            self.template = getenv_renamed(
+                "MILLET_SUMMARY_TEMPLATE",
+                "MEETSCRIBE_SUMMARY_TEMPLATE",
+            )
+        if self.template:
+            self.template = self.template.lower().strip()
+            # Template names become prompt filenames — restrict to a safe
+            # charset so no path traversal is possible.
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", self.template):
+                raise ValueError(
+                    f"Invalid summary template name {self.template!r}. "
+                    "Use lowercase letters, digits, '-' and '_'."
+                )
         if self.preset:
             self.preset = self.preset.lower().strip()
             if self.preset in SUMMARY_PRESETS:
@@ -492,6 +531,7 @@ class MeetingSummary:
     # was actually produced by a fallback backend instead of the configured
     # one.  Set by summarize() on the returned result before saving.
     preset: str | None = None
+    template: str | None = None
     fallback_used: bool = False
     # Optional fields populated by the two-pass Ollama flow
     pass1_seconds: float | None = None
@@ -511,6 +551,7 @@ class MeetingSummary:
         *,
         frontmatter_context: FrontmatterContext | None = None,
         lang_suffix: str | None = None,
+        artifact: str = "summary",
     ) -> Path:
         """Save the summary as a ``.summary.md`` file plus sidecars.
 
@@ -534,7 +575,14 @@ class MeetingSummary:
         sidecars) — without clobbering the primary auto-detected
         ``<basename>.summary.md``.  When ``None`` the primary filename is used.
 
-        Returns the path to the saved ``.summary[.<lang>].md`` file.
+        ``artifact`` names the output artifact family (default ``"summary"``).
+        A summary generated from a named template (e.g. ``"iteration-plan"``)
+        passes its template name here so the output is written as
+        ``<basename>.iteration-plan.md`` (with matching
+        ``.iteration-plan.meta.json`` and ``.iteration-plan.frontmatter.json``
+        sidecars) instead of clobbering the regular meeting summary.
+
+        Returns the path to the saved ``.<artifact>[.<lang>].md`` file.
         """
         import datetime
 
@@ -549,13 +597,18 @@ class MeetingSummary:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # A language-tagged additional summary uses a suffixed name so it
-        # coexists with the primary <basename>.summary.md.
+        # coexists with the primary <basename>.summary.md.  A non-default
+        # artifact family (template output) likewise gets its own name so it
+        # coexists with the meeting summary for the same session.
         suffix = f".{lang_suffix}" if lang_suffix else ""
-        md_path = output_dir / f"{basename}.summary{suffix}.md"
+        stem = artifact or "summary"
+        md_path = output_dir / f"{basename}.{stem}{suffix}.md"
         # Sidecar basename carries the suffix too (frontmatter writer appends
-        # ".frontmatter.json"), so additional-language sidecars don't clobber
-        # the primary's.
-        sidecar_basename = f"{basename}{suffix}"
+        # ".frontmatter.json"), so additional-language/artifact sidecars don't
+        # clobber the primary's.
+        sidecar_basename = (
+            f"{basename}{suffix}" if stem == "summary" else f"{basename}.{stem}{suffix}"
+        )
 
         if frontmatter_context is not None:
             fm = build_frontmatter(
@@ -575,6 +628,7 @@ class MeetingSummary:
             "backend": self.backend,
             "model": self.model,
             "preset": self.preset,
+            "template": self.template,
             "fallback_used": self.fallback_used,
             "elapsed_seconds": round(self.elapsed_seconds, 2),
             "timestamp": datetime.datetime.now().isoformat(),
@@ -589,7 +643,7 @@ class MeetingSummary:
             meta["data_error"] = self.data_error
         elif self.data is not None:
             meta["data_extracted"] = True
-        meta_path = output_dir / f"{basename}.summary{suffix}.meta.json"
+        meta_path = output_dir / f"{basename}.{stem}{suffix}.meta.json"
         meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
         return md_path
@@ -1292,6 +1346,7 @@ def _dispatch(
             temperature=config.temperature,
             num_ctx=config.num_ctx,
             ollama_singlepass=config.ollama_singlepass,
+            template=config.template,
         )
     else:
         fallback_config = config
@@ -1305,8 +1360,15 @@ def _dispatch(
     elif backend == "openai":
         result = _summarize_openai(system_prompt, user_prompt, fallback_config)
     else:
-        # Ollama: prefer the two-pass flow unless explicitly opted out
-        if not fallback_config.ollama_singlepass and transcript_text is not None:
+        # Ollama: prefer the two-pass flow unless explicitly opted out.  A
+        # named summary template always uses the single-pass flow — the
+        # two-pass extract/format prompts are specific to the default
+        # meeting-summary template.
+        if (
+            not fallback_config.ollama_singlepass
+            and transcript_text is not None
+            and not fallback_config.template
+        ):
             result = _summarize_ollama_twopass(
                 transcript_text,
                 fallback_config,
@@ -1371,10 +1433,16 @@ def summarize(
         if progress_callback:
             progress_callback(msg)
 
-    # Build prompts with language-aware section headers.
-    system_prompt = _build_system_prompt(language)
+    # Build prompts with language-aware section headers.  A named template
+    # swaps in its own prompt files (loaded per call — the module-level
+    # USER_PROMPT_TEMPLATE caches only the default template).
+    system_prompt = _build_system_prompt(language, template=config.template)
 
-    if language and language != "en":
+    if config.template:
+        user_prompt = _load_user_prompt_template(config.template).format(
+            transcript=transcript_text
+        )
+    elif language and language != "en":
         lang_name = _LANGUAGE_NAMES.get(language, language)
         user_prompt = USER_PROMPT_TEMPLATE_LANG.format(
             language=lang_name,
@@ -1436,7 +1504,7 @@ def summarize(
 
         # Inform the user when the local two-pass flow is about to run, since
         # it takes noticeably longer than a single LLM call.
-        if backend == "ollama" and not config.ollama_singlepass:
+        if backend == "ollama" and not config.ollama_singlepass and not config.template:
             _log("Running Ollama two-pass summarization (extract + format)...")
 
         try:
@@ -1449,6 +1517,7 @@ def summarize(
                 language=language,
             )
             result.preset = config.preset
+            result.template = config.template
             result.fallback_used = backend != config.backend
             if backend != config.backend:
                 _log(f"Summary generated via fallback backend {backend}")

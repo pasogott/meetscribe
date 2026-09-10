@@ -554,6 +554,7 @@ def apply_labels(
     summary_model: str | None = None,
     ollama_singlepass: bool = False,
     summary_language: str | None = None,
+    summary_template: str | None = None,
     progress_callback: Any | None = None,
 ) -> dict[str, Path]:
     """Apply user-assigned speaker names to a session's outputs.
@@ -582,6 +583,9 @@ def apply_labels(
             file, leaving the primary auto-detected ``<basename>.summary.md``
             intact.  When None, the transcript's own language is used and the
             primary summary file is (re)written.
+        summary_template: Optional summary prompt template name (e.g.
+            "iteration-plan").  Uses the template's prompt files and writes
+            ``<basename>.<template>.md`` instead of ``<basename>.summary.md``.
         progress_callback: Optional callable(str) for status messages.
 
     Returns:
@@ -636,6 +640,8 @@ def apply_labels(
                 cfg_kwargs["model"] = summary_model
             if ollama_singlepass:
                 cfg_kwargs["ollama_singlepass"] = True
+            if summary_template:
+                cfg_kwargs["template"] = summary_template
             summary_config = SummaryConfig(**cfg_kwargs)
 
             if is_backend_available(summary_config):
@@ -654,11 +660,13 @@ def apply_labels(
                 from millet.frontmatter import context_from_transcript
 
                 fm_ctx = context_from_transcript(transcript, session_dir)
+                artifact = summary_template or "summary"
                 path = summary_result.save(
                     session_dir, basename, frontmatter_context=fm_ctx,
                     lang_suffix=lang_suffix,
+                    artifact=artifact,
                 )
-                result_files["summary"] = path
+                result_files[artifact] = path
                 if lang_suffix:
                     _log(
                         f"Additional '{lang_suffix}' summary generated in "

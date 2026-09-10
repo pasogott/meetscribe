@@ -45,7 +45,7 @@ def _drain_countdown(session, seconds: int = DRAIN_SECONDS) -> None:
 
 def _generate_summary(
     transcript, out_dir, basename, summary_model, files, summary_backend=None,
-    summary_preset=None, ollama_singlepass=False,
+    summary_preset=None, ollama_singlepass=False, summary_template=None,
 ):
     """Generate an AI meeting summary. Returns MeetingSummary or None.
 
@@ -57,6 +57,11 @@ def _generate_summary(
     for the ollama backend.  By default the two-pass (extract+format) flow
     is used, which is more accurate on local 20B-class models at the cost
     of one extra LLM call.
+
+    When ``summary_template`` names a summary template (e.g.
+    "iteration-plan"), the template's prompt files are used and the output
+    is written as ``<basename>.<template>.md`` instead of the default
+    ``<basename>.summary.md``.
     """
     from millet.summarize import SummaryConfig
     from millet.summarize import summarize as do_summarize
@@ -70,11 +75,14 @@ def _generate_summary(
         config_kwargs["model"] = summary_model
     if ollama_singlepass:
         config_kwargs["ollama_singlepass"] = True
+    if summary_template:
+        config_kwargs["template"] = summary_template
     summary_config = SummaryConfig(**config_kwargs)
 
     def _cli_progress(msg: str) -> None:
         click.echo(f"  {msg}")
 
+    artifact = summary_template or "summary"
     click.echo(
         f"Generating meeting summary ({summary_config.model} via {summary_config.backend})..."
     )
@@ -88,8 +96,8 @@ def _generate_summary(
         from millet.frontmatter import context_from_transcript
 
         fm_ctx = context_from_transcript(transcript, out_dir)
-        path = result.save(out_dir, basename, frontmatter_context=fm_ctx)
-        files["summary"] = path
+        path = result.save(out_dir, basename, frontmatter_context=fm_ctx, artifact=artifact)
+        files[artifact] = path
         click.echo(f"  Summary generated in {result.elapsed_seconds:.1f}s")
         return result
     except Exception as exc:

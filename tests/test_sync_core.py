@@ -215,6 +215,24 @@ def test_collect_files_keeps_original_name_on_collision(tmp_path):
     assert "b.txt" in dests
 
 
+def test_collect_files_pushes_iteration_plan_artifact(tmp_path):
+    """Template summaries (<base>.iteration-plan.md) push under their own
+    descriptive name — not as summary.md — and their meta sidecar is
+    excluded like .summary.meta.json."""
+    sdir = tmp_path / "s"
+    sdir.mkdir()
+    (sdir / "meeting.txt").write_text("transcript")
+    (sdir / "meeting.summary.md").write_text("real summary")
+    (sdir / "meeting.iteration-plan.md").write_text("plan")
+    (sdir / "meeting.iteration-plan.meta.json").write_text("{}")
+
+    dests = [d for _, d in sync._collect_files(sdir)]
+    assert "summary.md" in dests
+    assert "iteration-plan.md" in dests
+    # Meta sidecar excluded; no *.meta.json pushed as transcript.json.
+    assert not any("meta" in d for d in dests), dests
+
+
 # ─── ensure_repo_cloned: rebase abort on pull failure ────────────────────────
 
 
