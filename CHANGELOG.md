@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.18.0 — feat: `meetings_subdir` per-team sync target subdirectory
+
+### Added
+
+* **`millet/sync.py`** — teams can now sync into a custom subdirectory of
+  the configured repo via the `"meetings_subdir"` key in
+  `sync_config.json` (default `"meetings"`, unchanged).  A team whose
+  screenrecording iteration loops share a repo with regular meetings
+  keeps a separate tree — e.g. `screenrecordings/<date>_<folder>/` —
+  instead of mixing into the general `meetings/` archive.  The value is
+  validated like a meeting folder slug (single safe path segment), so a
+  hostile or corrupt config cannot escape the clone.  4 new tests
+  (default, custom, traversal rejection, end-to-end push into the custom
+  tree against a local bare repo).
+
 ## v0.17.0 — feat: summary templates (`--summary-template`) + `iteration-plan` prompt
 
 ### Added

@@ -61,6 +61,20 @@ def _validate_folder_slug(folder: str, source: str) -> str:
         )
     return folder
 
+
+def _meetings_subdir(team: str | None = None) -> str:
+    """Repo subdirectory sessions sync into (default ``"meetings"``).
+
+    Overridable per team via the ``meetings_subdir`` key in
+    sync_config.json — e.g. a team whose screenrecording iteration loops
+    share a repo with regular meetings can keep a separate
+    ``screenrecordings/`` tree instead of mixing into ``meetings/``.
+    Validated like a folder slug: a hostile value (``../x``) must not
+    escape the clone.
+    """
+    subdir = load_sync_config(team).get("meetings_subdir") or MEETINGS_SUBDIR
+    return _validate_folder_slug(subdir, "meetings_subdir in sync_config.json")
+
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
 SYNC_CONFIG_PATH = Path.home() / ".config" / "meet" / "sync_config.json"
@@ -853,6 +867,7 @@ def sync_session(
 
     repo = ensure_repo_cloned(progress_callback=progress_callback, team=team)
 
+    subdir = _meetings_subdir(team)
     date_str = _date_from_session(session_dir)
     session_id = _session_id_for(session_dir)
     # Each meeting gets its own folder: date first so folders sort chronologically.
@@ -860,14 +875,14 @@ def sync_session(
     # session, don't overwrite it — disambiguate with a short suffix.  Prevents
     # two meetings that resolve to the same folder (e.g. two ad-hoc meetings in
     # one schedule window) from clobbering each other.
-    base_dir = repo / MEETINGS_SUBDIR / f"{date_str}_{meeting_type.folder}"
+    base_dir = repo / subdir / f"{date_str}_{meeting_type.folder}"
     target_dir = _resolve_target_dir(base_dir, session_id, _log)
     target_dir.mkdir(parents=True, exist_ok=True)
     if session_id:
         (target_dir / SESSION_ID_MARKER).write_text(session_id + "\n", encoding="utf-8")
 
     # Ensure README exists
-    _ensure_readme(repo / MEETINGS_SUBDIR, team=team)
+    _ensure_readme(repo / subdir, team=team)
 
     # Collect and copy files with descriptive names
     source_files = _collect_files(session_dir)
@@ -885,7 +900,7 @@ def sync_session(
 
     # Also stage the README
     _run(
-        ["git", "add", str((repo / MEETINGS_SUBDIR / "README.md").relative_to(repo))],
+        ["git", "add", str((repo / subdir / "README.md").relative_to(repo))],
         cwd=repo,
     )
 

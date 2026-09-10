@@ -233,6 +233,40 @@ def test_collect_files_pushes_iteration_plan_artifact(tmp_path):
     assert not any("meta" in d for d in dests), dests
 
 
+# ─── meetings_subdir (0.18.0) ────────────────────────────────────────────────
+
+
+def test_meetings_subdir_defaults_to_meetings(monkeypatch):
+    monkeypatch.setattr(
+        sync, "load_sync_config",
+        lambda team=None, config_path=None: {"repo_url": "https://x/r.git"},
+    )
+    assert sync._meetings_subdir() == "meetings"
+
+
+def test_meetings_subdir_custom_from_config(monkeypatch):
+    monkeypatch.setattr(
+        sync, "load_sync_config",
+        lambda team=None, config_path=None: {
+            "repo_url": "https://x/r.git",
+            "meetings_subdir": "screenrecordings",
+        },
+    )
+    assert sync._meetings_subdir() == "screenrecordings"
+
+
+def test_meetings_subdir_rejects_traversal(monkeypatch):
+    monkeypatch.setattr(
+        sync, "load_sync_config",
+        lambda team=None, config_path=None: {
+            "repo_url": "https://x/r.git",
+            "meetings_subdir": "../escape",
+        },
+    )
+    with pytest.raises(RuntimeError, match="Invalid meeting folder"):
+        sync._meetings_subdir()
+
+
 # ─── ensure_repo_cloned: rebase abort on pull failure ────────────────────────
 
 
@@ -342,6 +376,35 @@ def test_sync_session_pushes_to_local_remote(monkeypatch, tmp_path, local_remote
     # Re-sync of the same session is idempotent (no crash, same folder).
     copied2 = sync.sync_session(sdir, match, progress_callback=lambda m: None)
     assert copied2
+
+
+def test_sync_session_pushes_to_custom_meetings_subdir(
+    monkeypatch, tmp_path, local_remote
+):
+    """0.18.0: meetings_subdir routes sessions into a separate tree
+    (e.g. screenrecordings/) in the same repo, leaving meetings/ alone."""
+    monkeypatch.setattr(sync, "CLONE_BASE_DIR", tmp_path / "clones")
+    monkeypatch.setattr(
+        sync, "load_sync_config",
+        lambda team=None, config_path=None: {
+            "repo_url": str(local_remote),
+            "meetings": [],
+            "meetings_subdir": "screenrecordings",
+        },
+    )
+
+    sdir = _make_session(tmp_path, "meeting-20260706-100000", "01TESTULID2")
+    match = sync.MeetingMatch(name="Demo", folder="demo")
+    copied = sync.sync_session(sdir, match, progress_callback=lambda m: None)
+    assert copied
+
+    check = tmp_path / "check-subdir"
+    _git("clone", str(local_remote), str(check))
+    demo_dir = check / "screenrecordings" / "2026-07-06_demo"
+    assert demo_dir.is_dir()
+    assert (demo_dir / "summary.md").read_text() == "# Summary\n"
+    # Nothing leaked into the default meetings/ tree.
+    assert not (check / "meetings").exists()
 
 
 def test_sync_session_disambiguates_different_session(
