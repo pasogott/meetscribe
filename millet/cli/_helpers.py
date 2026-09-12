@@ -46,6 +46,7 @@ def _drain_countdown(session, seconds: int = DRAIN_SECONDS) -> None:
 def _generate_summary(
     transcript, out_dir, basename, summary_model, files, summary_backend=None,
     summary_preset=None, ollama_singlepass=False, summary_template=None,
+    frames=None,
 ):
     """Generate an AI meeting summary. Returns MeetingSummary or None.
 
@@ -77,7 +78,11 @@ def _generate_summary(
         config_kwargs["ollama_singlepass"] = True
     if summary_template:
         config_kwargs["template"] = summary_template
+    if frames:
+        config_kwargs["frames"] = frames
     summary_config = SummaryConfig(**config_kwargs)
+    if summary_config.frames:
+        click.echo(f"  Including {len(summary_config.frames)} cue frame(s)")
 
     def _cli_progress(msg: str) -> None:
         click.echo(f"  {msg}")

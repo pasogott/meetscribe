@@ -33,6 +33,20 @@ def _echo_offline_model_help(model: str, audio_file: str) -> None:
     )
 
 
+def _cue_frames(audio_path, enabled: bool):
+    """Cue frames sitting next to the session, or None when disabled/absent.
+
+    Deliberately keyed off ``audio_path.parent`` (the true session dir) and
+    not ``--output-dir``: the frames belong to the recording, wherever the
+    outputs are written.
+    """
+    if not enabled:
+        return None
+    from millet.summarize import discover_cue_frames
+
+    return discover_cue_frames(audio_path.parent) or None
+
+
 @click.command()
 @click.argument("audio_file", type=click.Path(exists=True))
 @click.option(
@@ -167,6 +181,14 @@ def _echo_offline_model_help(model: str, audio_file: str) -> None:
     "via MILLET_SUMMARY_TEMPLATE.",
 )
 @click.option(
+    "--summary-frames/--no-summary-frames",
+    default=True,
+    help="Include cue frames (<session>/attachments/cue_*.png) in the summary "
+    "when the model can accept image input, so a narrated screen recording is "
+    "summarized from what is on screen as well as what was said. On by "
+    "default; a no-op when no frames exist.",
+)
+@click.option(
     "--ollama-singlepass",
     is_flag=True,
     default=False,
@@ -255,6 +277,7 @@ def transcribe(
     summary_backend,
     summary_model,
     summary_template,
+    summary_frames,
     ollama_singlepass,
     skip_alignment,
     mixdown,
@@ -415,6 +438,7 @@ def transcribe(
                 summary_preset=summary_preset,
                 ollama_singlepass=ollama_singlepass,
                 summary_template=summary_template,
+                frames=_cue_frames(audio_path, summary_frames),
             )
         except Exception as exc:
             # Only raised when summary_preset was set (preset guard).

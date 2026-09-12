@@ -1,5 +1,94 @@
 # Changelog
 
+## v0.20.0 — feat: summarize from what's on screen, not just what was said
+
+A narrated screen recording carries one PNG per transcript cue.  Those
+frames can now be sent to a vision-capable TEE model alongside the
+transcript, so an iteration plan reports what is **visibly** wrong rather
+than only what the narrator happened to say out loud.
+
+On a real 31-frame session the vision run surfaced five issues that are
+not derivable from the transcript at any quality of language model:
+
+* a "Save Changes" bar overlapping the "Start Unilateral Exit" row,
+* a destination field accepting a **mainnet** `bc1p…` address while the
+  wallet was on **regtest** (it read both addresses off-screen and
+  reasoned about the mismatch) — a funds-loss bug,
+* Slow/Medium/Fast fee tiers all rendering an identical "1 sat/vB",
+* narration saying "1.1.0" while the footer read "Glow v1.2.0 (dev)",
+* "Buy Bitcoin" filed under the "Display" settings section.
+
+### Added
+
+* **`SummaryConfig.frames`** — optional list of still images sent with the
+  transcript.  Normalized on construction (readable image files only,
+  de-duplicated, ordered, capped at `MAX_FRAMES = 45`); anything unusable
+  is dropped quietly, because frames are an enhancement and must never
+  fail a summary the caller asked for.
+* **`discover_cue_frames(session_dir)`** — finds
+  `<session>/attachments/cue_*.png`, whose names sort into narration
+  order.  Wired into `millet label` (so a re-summary of an existing
+  session picks frames up automatically — the path vezir uses) and into
+  `millet transcribe` via `--summary-frames/--no-summary-frames`.
+* **`MeetingSummary.frames_used`**, recorded in the `.meta.json` sidecar.
+  0 means the summary was text-only — either no frames were supplied, or
+  the model that served it cannot see.
+* **Vision allowlist** (`VISION_MODELS`), deliberately *not* Tinfoil's
+  advertised `multimodal` flag.  The catalog marks
+  `deepseek-v4-1-flash` multimodal, but its vision endpoint answers 502 on
+  every request (verified 2026-09-12 over three consecutive attempts).
+  Since that model is the sibling fallback, trusting the flag would turn a
+  drained primary pool into a hard failure.  A model that cannot see gets
+  the prompt as plain text instead.
+
+### Fixed
+
+* **Enclave attestation failures are now retried.**  Tinfoil intermittently
+  serves a malformed SEV attestation report (`current_tcb not correctly
+  formed`) and the SDK correctly refuses the response.  This was classified
+  non-transient, so it failed the job outright with zero retries — on the
+  `confidential` path, which by design has no fallback.  Measured failure
+  rate on 2026-09-12: **9/12 requests succeeded (~25% failure)**, on plain
+  text requests, i.e. this was silently costing real jobs.
+
+  Attestation errors get their own larger budget
+  (`_TINFOIL_ATTEST_MAX_ATTEMPTS = 6`, flat 1.5 s backoff) and do **not**
+  consume the attempts reserved for genuine network faults, because they
+  fail fast — during enclave verification, before any tokens are generated.
+  Retrying does not weaken the guarantee: an unverified response is never
+  accepted, we simply ask again, and exhausting the budget raises an error
+  that says so explicitly.  They are classified transient but *not* a pool
+  error, so the retry stays on the same model — a sibling runs on the same
+  enclave infrastructure and would fail identically.
+
+* **Sibling-fallback provenance was being erased.**  `summarize()` assigned
+  `result.fallback_used = backend != config.backend`, overwriting the flag
+  the tinfoil backend had already set for a sibling-model fallback (which
+  keeps `backend == config.backend`).  Every 0.18.1 sibling rescue was
+  therefore recorded as "no fallback" in the sidecar.  The existing test
+  missed it by calling `_summarize_tinfoil` directly rather than going
+  through `summarize()`.
+
+### Changed
+
+* The `iteration-plan` prompt no longer merely *claims* a screenshot
+  exists for every cue — it explains how to use them when present, demands
+  that visible defects be described in the actual on-screen wording,
+  forbids claiming to see anything not in a frame, and still works from the
+  transcript alone when no frames are supplied.
+
+### Cost
+
+~2.2k tokens per 880×1920 frame, linear.  A 31-frame session ran 126.9 s
+and cost roughly $0.03 — against 43.2 s text-only.
+
+### Tests
+
+385 (up from 351): 34 new across frame normalization, discovery, vision
+gating, message construction, degradation to text-only, frames surviving
+the dispatch rebuild, attestation retry/budget-isolation, and the
+fallback-provenance regression.
+
 ## v0.19.0 — BREAKING: private-only summarization (cloud backends removed)
 
 Meeting content no longer reaches any party that can read it.  The three

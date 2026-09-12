@@ -624,6 +624,7 @@ def apply_labels(
             from millet.summarize import (
                 SummaryConfig,
                 _backend_not_available_message,
+                discover_cue_frames,
                 is_backend_available,
             )
             from millet.summarize import (
@@ -642,7 +643,21 @@ def apply_labels(
                 cfg_kwargs["ollama_singlepass"] = True
             if summary_template:
                 cfg_kwargs["template"] = summary_template
+            # Narrated screen recordings: show the model the screen at each
+            # cue, not just the narration.  Frames are written next to the
+            # session by the caller (vezir) *after* transcription, so they
+            # only exist on a re-summary like this one -- which is exactly
+            # the path that regenerates an iteration plan.  Missing frames
+            # are normal (audio meetings) and simply summarize as before.
+            frames = discover_cue_frames(session_dir)
+            if frames:
+                cfg_kwargs["frames"] = frames
             summary_config = SummaryConfig(**cfg_kwargs)
+            if frames:
+                _log(
+                    f"Found {len(frames)} cue frame(s) alongside the session; "
+                    "including them in the summary"
+                )
 
             if is_backend_available(summary_config):
                 # Only free GPU for Ollama backend

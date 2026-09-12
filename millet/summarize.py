@@ -26,6 +26,7 @@ Configuration precedence (highest to lowest):
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -129,6 +130,64 @@ def verify_tinfoil_model(model: str, *, timeout: int = 10) -> str | None:
 
     logger.warning("%s", problem)
     return problem
+
+
+# ─── Vision (still frames alongside the transcript) ─────────────────────────
+
+# Models that accept image input.  Deliberately an allowlist of models we
+# have actually exercised, NOT Tinfoil's advertised `multimodal` flag: that
+# flag is set for deepseek-v4-1-flash, whose vision endpoint answers 502 on
+# every request (verified 2026-09-12).  Trusting the catalog would turn a
+# frames run into a hard failure on the sibling fallback.
+VISION_MODELS = ("glm-5-3-flash",)
+
+# Per-frame cost is roughly 2.2k tokens at 880x1920, linear in frame count.
+# The cap bounds a pathological session rather than trimming a normal one
+# (vezir already samples down to 45 frames before we ever see them).
+MAX_FRAMES = 45
+_FRAME_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+_MAX_FRAME_BYTES = 8 * 1024 * 1024
+
+
+def _usable_frames(frames: list[Path]) -> list[Path]:
+    """Filter to readable image files, de-duplicated, ordered, capped."""
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for raw in frames:
+        p = Path(raw)
+        if p in seen:
+            continue
+        seen.add(p)
+        if p.suffix.lower() not in _FRAME_SUFFIXES:
+            continue
+        try:
+            if not p.is_file() or p.stat().st_size > _MAX_FRAME_BYTES:
+                continue
+        except OSError:
+            continue
+        out.append(p)
+    if len(out) > MAX_FRAMES:
+        logger.info("frames: %d supplied, using the first %d", len(out), MAX_FRAMES)
+        out = out[:MAX_FRAMES]
+    return out
+
+
+def model_supports_vision(model: str | None) -> bool:
+    """True when ``model`` is known to accept image input."""
+    return bool(model) and any(model.startswith(m) for m in VISION_MODELS)
+
+
+def discover_cue_frames(session_dir: Path) -> list[Path]:
+    """Cue frames written next to a session, oldest cue first.
+
+    vezir extracts one PNG per narrated transcript cue into
+    ``<session>/attachments/cue_HH-MM-SS.png``.  Sorting by name sorts by
+    timestamp, which is the order the narration happened in.
+    """
+    try:
+        return sorted((Path(session_dir) / "attachments").glob("cue_*.png"))
+    except OSError:
+        return []
 
 
 # Supported backends.  Both are private: tinfoil runs inside a hardware
@@ -550,6 +609,12 @@ class SummaryConfig:
     temperature: float = 0.3
     num_ctx: int = 8192  # Ollama-specific context window
     ollama_singlepass: bool | None = None  # None = resolve from env (default: two-pass)
+    # Optional still frames (PNG/JPEG) shown to the model alongside the
+    # transcript.  Used by the narrated screen-recording flow, where each
+    # frame is the screen at a transcript cue, so the model can report what
+    # it can SEE rather than only what was said.  Ignored by backends and
+    # models that cannot accept image input -- never a hard failure.
+    frames: list[Path] | None = None
 
     def __post_init__(self):
         # Resolve preset: explicit arg > env var > None
@@ -607,6 +672,12 @@ class SummaryConfig:
         if self.ollama_singlepass is None:
             self.ollama_singlepass = _resolve_ollama_singlepass()
 
+        # Normalize frames: keep only readable image files, in a stable
+        # order, capped.  Frames are an enhancement, so anything unusable is
+        # dropped quietly rather than failing a summary the caller wants.
+        if self.frames:
+            self.frames = _usable_frames(self.frames)
+
 
 @dataclass
 class MeetingSummary:
@@ -630,6 +701,10 @@ class MeetingSummary:
     preset: str | None = None
     template: str | None = None
     fallback_used: bool = False
+    # Number of still frames actually sent to the model.  0 means the
+    # summary was text-only, either because no frames were supplied or
+    # because the model that served the request cannot see images.
+    frames_used: int = 0
     # Optional fields populated by the two-pass Ollama flow
     pass1_seconds: float | None = None
     pass2_seconds: float | None = None
@@ -727,6 +802,7 @@ class MeetingSummary:
             "preset": self.preset,
             "template": self.template,
             "fallback_used": self.fallback_used,
+            "frames_used": self.frames_used,
             "elapsed_seconds": round(self.elapsed_seconds, 2),
             "timestamp": datetime.datetime.now().isoformat(),
         }
@@ -994,6 +1070,16 @@ def _summarize_ollama_twopass(
 _TINFOIL_MAX_ATTEMPTS = 3
 _TINFOIL_BACKOFF_BASE = 2.0  # seconds: ~2s, 4s, 8s
 
+# Attestation-verification blips get their own, larger budget.  Measured
+# 2026-09-12: 9/12 plain requests succeeded, i.e. a ~25% failure rate,
+# randomly distributed — three attempts leaves a real chance of losing a
+# job to pure luck.  These are safe to retry generously because they fail
+# *fast*, during enclave verification and before any tokens are generated,
+# unlike a timeout.  Retrying never weakens the guarantee: an unverified
+# response is still never accepted.
+_TINFOIL_ATTEST_MAX_ATTEMPTS = 6
+_TINFOIL_ATTEST_BACKOFF = 1.5  # seconds, flat — the blip clears quickly
+
 
 def _is_transient_network_error(exc: BaseException) -> bool:
     """True if ``exc`` looks like a transient connectivity/DNS blip worth
@@ -1056,8 +1142,31 @@ def _is_transient_network_error(exc: BaseException) -> bool:
         "engine is currently overloaded",
         "error code: 503",
         "service unavailable",
+        # Tinfoil occasionally serves a malformed SEV attestation report
+        # ("current_tcb not correctly formed"), and the SDK refuses the
+        # response.  Observed intermittently on 2026-09-12: two failures
+        # then success, on plain text requests.  Retrying is safe and does
+        # NOT weaken the guarantee -- an unverified response is never
+        # accepted; we simply ask again and either get a report that
+        # verifies or fail loudly.  Without this the confidential path
+        # fails a job outright on a blip that clears in seconds.
+        "attestation verification failed",
+        "failed to parse report",
     )
     return any(m in msg for m in markers)
+
+
+def _is_attestation_error(exc: BaseException) -> bool:
+    """True when the TEE's attestation report could not be verified.
+
+    The SDK refuses such a response, which is the correct behaviour — we
+    never accept unverified inference.  It is worth distinguishing because
+    it is provider-side, frequent (~25% of requests on 2026-09-12), fails
+    fast, and clears on its own, so it earns a larger retry budget than a
+    genuine network fault without weakening any guarantee.
+    """
+    msg = str(exc).lower()
+    return "attestation verification failed" in msg or "failed to parse report" in msg
 
 
 def _is_model_pool_error(exc: BaseException) -> bool:
@@ -1113,9 +1222,53 @@ def _summarize_tinfoil(
 
     from tinfoil import TinfoilAI
 
+    frames = config.frames or []
+    frames_sent = 0
+
+    def _user_content(model: str):
+        """User message body: plain string, or multi-part when sending frames.
+
+        Frames are dropped for a model not on the vision allowlist -- notably
+        the sibling fallback -- so a drained enclave degrades a vision run to
+        text-only instead of failing it outright.
+        """
+        nonlocal frames_sent
+        if not frames:
+            frames_sent = 0
+            return user_prompt
+        if not model_supports_vision(model):
+            frames_sent = 0
+            logger.warning(
+                "model %r cannot accept image input; summarizing %d frame(s) "
+                "as text-only", model, len(frames),
+            )
+            return user_prompt
+        parts: list[dict] = [{"type": "text", "text": user_prompt}]
+        for p in frames:
+            try:
+                encoded = base64.b64encode(p.read_bytes()).decode("ascii")
+            except OSError as exc:
+                logger.warning("frames: skipping unreadable %s (%s)", p.name, exc)
+                continue
+            mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{encoded}"},
+            })
+        frames_sent = len(parts) - 1
+        return parts
+
     def _attempt(model: str):
-        """Call one TEE model with the retry/backoff budget. Raises on failure."""
-        for attempt in range(1, _TINFOIL_MAX_ATTEMPTS + 1):
+        """Call one TEE model with the retry/backoff budget. Raises on failure.
+
+        Attestation failures consume a separate budget: they are frequent,
+        fail fast, and are unrelated to the model or the network, so they
+        should not burn the attempts reserved for genuine transients.
+        """
+        attempt = 0
+        attest_failures = 0
+        while True:
+            attempt += 1
             try:
                 # Client init does a network fetch (router discovery) — keep it
                 # inside the retry so a DNS blip here doesn't hard-fail.
@@ -1129,12 +1282,33 @@ def _summarize_tinfoil(
                     model=model,
                     messages=[
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
+                        {"role": "user", "content": _user_content(model)},
                     ],
                     temperature=config.temperature,
                     timeout=config.timeout,
                 )
             except Exception as e:
+                if _is_attestation_error(e):
+                    attest_failures += 1
+                    attempt -= 1  # doesn't consume the transient budget
+                    if attest_failures < _TINFOIL_ATTEST_MAX_ATTEMPTS:
+                        logger.warning(
+                            "Tinfoil enclave attestation failed (%d/%d) for "
+                            "%r; re-verifying in %.1fs: %s",
+                            attest_failures,
+                            _TINFOIL_ATTEST_MAX_ATTEMPTS,
+                            model,
+                            _TINFOIL_ATTEST_BACKOFF,
+                            e,
+                        )
+                        time.sleep(_TINFOIL_ATTEST_BACKOFF)
+                        continue
+                    raise RuntimeError(
+                        f"Tinfoil enclave attestation could not be verified after "
+                        f"{_TINFOIL_ATTEST_MAX_ATTEMPTS} attempts. The response was "
+                        f"never accepted unverified — this is a provider-side "
+                        f"attestation fault, not a downgrade: {e}"
+                    ) from e
                 if attempt < _TINFOIL_MAX_ATTEMPTS and _is_transient_network_error(e):
                     wait = _TINFOIL_BACKOFF_BASE**attempt
                     logger.warning(
@@ -1199,6 +1373,7 @@ def _summarize_tinfoil(
         elapsed_seconds=elapsed,
         backend="tinfoil",
         fallback_used=sibling_used,
+        frames_used=frames_sent,
     )
 
 
@@ -1266,6 +1441,9 @@ def _dispatch(
             num_ctx=config.num_ctx,
             ollama_singlepass=config.ollama_singlepass,
             template=config.template,
+            # Carry frames too: a rebuilt config that drops them would
+            # silently downgrade a vision run to text-only on fallback.
+            frames=config.frames,
         )
     else:
         fallback_config = config
@@ -1426,7 +1604,11 @@ def summarize(
             )
             result.preset = config.preset
             result.template = config.template
-            result.fallback_used = backend != config.backend
+            # OR rather than assign: a backend may already have recorded its
+            # own internal fallback.  The tinfoil sibling-model fallback
+            # (0.18.1) keeps backend == config.backend, so a plain assignment
+            # here silently erased it from the meta sidecar.
+            result.fallback_used = (backend != config.backend) or result.fallback_used
             if backend != config.backend:
                 _log(f"Summary generated via fallback backend {backend}")
             return result
