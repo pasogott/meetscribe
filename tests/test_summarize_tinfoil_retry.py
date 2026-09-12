@@ -94,7 +94,7 @@ def test_retries_transient_then_succeeds(monkeypatch):
         # Second attempt succeeds.
 
     state = _install_fake_tinfoil(monkeypatch, behavior)
-    cfg = SummaryConfig(backend="tinfoil", model="glm-5-2")
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-3-flash")
     result = sm._summarize_tinfoil("sys", "user", cfg)
     assert state["attempt"] == 2  # retried once
     assert "Meeting Overview" in result.markdown
@@ -106,7 +106,7 @@ def test_persistent_transient_fails_after_max_attempts(monkeypatch):
         raise socket.gaierror(-2, "Name or service not known")
 
     state = _install_fake_tinfoil(monkeypatch, behavior)
-    cfg = SummaryConfig(backend="tinfoil", model="glm-5-2")
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-3-flash")
     with pytest.raises(RuntimeError, match="unreachable after"):
         sm._summarize_tinfoil("sys", "user", cfg)
     assert state["attempt"] == sm._TINFOIL_MAX_ATTEMPTS  # all attempts used
@@ -118,7 +118,7 @@ def test_completion_call_passes_timeout(monkeypatch):
     enclave hung the pipeline forever, worst for the no-fallback
     `confidential` preset."""
     state = _install_fake_tinfoil(monkeypatch, lambda attempt: None)
-    cfg = SummaryConfig(backend="tinfoil", model="glm-5-2")
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-3-flash")
     sm._summarize_tinfoil("sys", "user", cfg)
     assert state["create_kwargs"].get("timeout") == cfg.timeout
     assert cfg.timeout and cfg.timeout > 0
@@ -129,7 +129,184 @@ def test_auth_error_fails_fast_no_retry(monkeypatch):
         raise RuntimeError("401 Unauthorized: invalid API key")
 
     state = _install_fake_tinfoil(monkeypatch, behavior)
-    cfg = SummaryConfig(backend="tinfoil", model="glm-5-2")
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-3-flash")
     with pytest.raises(RuntimeError, match="Tinfoil TEE API error"):
         sm._summarize_tinfoil("sys", "user", cfg)
     assert state["attempt"] == 1  # no retry on a real auth error
+
+
+# ── capacity (503) classification + sibling TEE fallback (v0.18.1) ───────────
+#
+# Tinfoil retired glm-5-2 with no notice: the model vanished from /v1/models
+# and every request started returning 503 "engine is currently overloaded".
+# That is not an auth error and not a DNS error, so it previously failed the
+# job instantly — on the one preset that by design never falls back.
+
+_OVERLOADED = (
+    "Error code: 503 - {'error': {'message': 'The engine is currently "
+    "overloaded, please try again later.', 'type': 'server_error'}}"
+)
+_NO_MODEL = (
+    "Error code: 404 - {'error': {'message': 'The model does not exist.', "
+    "'type': 'invalid_request_error'}}"
+)
+
+
+def test_classifier_flags_503_overloaded():
+    assert _is_transient_network_error(RuntimeError(_OVERLOADED))
+
+
+def test_classifier_rejects_404_missing_model():
+    """A retired model will never come back — retrying it is pointless."""
+    assert not _is_transient_network_error(RuntimeError(_NO_MODEL))
+
+
+def test_pool_error_classifier_distinguishes_model_from_service():
+    assert sm._is_model_pool_error(RuntimeError(_OVERLOADED))
+    assert sm._is_model_pool_error(RuntimeError(_NO_MODEL))
+    # Service-wide connectivity failure: a sibling model would fail too.
+    assert not sm._is_model_pool_error(
+        ValueError("Failed to fetch router addresses: <urlopen error>")
+    )
+
+
+def test_persistent_503_falls_back_to_sibling_tee_model(monkeypatch):
+    """A drained pool on the primary must not kill the job: retry the
+    sibling TEE model, which keeps the confidential contract intact."""
+    seen: list[str] = []
+
+    def behavior(attempt):
+        pass  # client construction always succeeds
+
+    _install_fake_tinfoil(monkeypatch, behavior)
+
+    import sys as _sys
+
+    fake = _sys.modules["tinfoil"]
+
+    class _Msg:
+        content = "## Meeting Overview\n\nFrom the sibling."
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    class _Completions:
+        def create(self, **kwargs):
+            seen.append(kwargs["model"])
+            if kwargs["model"] == "glm-5-3-flash":
+                raise RuntimeError(_OVERLOADED)
+            return _Resp()
+
+    class _Chat:
+        completions = _Completions()
+
+    class FakeAI:
+        def __init__(self, api_key=None):
+            self.chat = _Chat()
+
+    fake.TinfoilAI = FakeAI
+
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-3-flash")
+    result = sm._summarize_tinfoil("sys", "user", cfg)
+
+    # Primary exhausted its retry budget, then the sibling was tried.
+    assert seen.count("glm-5-3-flash") == sm._TINFOIL_MAX_ATTEMPTS
+    assert sm.DEFAULT_TINFOIL_FALLBACK_MODEL in seen
+    # Still a TEE model, and the switch is recorded — never silent.
+    assert result.backend == "tinfoil"
+    assert result.fallback_used is True
+    assert sm.DEFAULT_TINFOIL_FALLBACK_MODEL in result.model
+    assert "(TEE)" in result.model
+
+
+def test_dns_failure_does_not_try_sibling(monkeypatch):
+    """Router-discovery failure means Tinfoil itself is unreachable —
+    a sibling model would fail identically, so don't waste the round trip."""
+
+    def behavior(attempt):
+        raise socket.gaierror(-2, "Name or service not known")
+
+    state = _install_fake_tinfoil(monkeypatch, behavior)
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-3-flash")
+    with pytest.raises(RuntimeError, match="unreachable after"):
+        sm._summarize_tinfoil("sys", "user", cfg)
+    assert state["attempt"] == sm._TINFOIL_MAX_ATTEMPTS
+
+
+def test_sibling_differs_from_primary_family():
+    """The sibling must not share the primary's model family, or a single
+    drained pool (exactly what killed glm-5-2) takes out both."""
+    primary = sm.DEFAULT_TINFOIL_MODEL.split("-")[0]
+    sibling = sm.DEFAULT_TINFOIL_FALLBACK_MODEL.split("-")[0]
+    assert primary != sibling
+
+
+# ── catalog pre-flight probe (v0.18.1) ──────────────────────────────────────
+
+
+def _fake_catalog(monkeypatch, data, *, key="tk_fake"):
+    monkeypatch.setattr(sm, "_resolve_tinfoil_api_key", lambda: key)
+    sm._TINFOIL_CATALOG_CHECKED.clear()
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": data}
+
+    monkeypatch.setattr(sm.requests, "get", lambda *a, **k: _Resp())
+
+
+def test_probe_flags_retired_model(monkeypatch):
+    _fake_catalog(monkeypatch, [{"id": "glm-5-3-flash"}])
+    problem = sm.verify_tinfoil_model("glm-5-2")
+    assert problem and "not in the catalog" in problem
+
+
+def test_probe_flags_deprecated_model(monkeypatch):
+    _fake_catalog(
+        monkeypatch,
+        [{"id": "deepseek-v4-flash", "deprecated": True, "deprecationDate": "2026-09-15"}],
+    )
+    problem = sm.verify_tinfoil_model("deepseek-v4-flash")
+    assert problem and "2026-09-15" in problem
+
+
+def test_probe_silent_for_healthy_model(monkeypatch):
+    _fake_catalog(monkeypatch, [{"id": "glm-5-3-flash"}])
+    assert sm.verify_tinfoil_model("glm-5-3-flash") is None
+
+
+def test_probe_never_raises_on_network_failure(monkeypatch):
+    monkeypatch.setattr(sm, "_resolve_tinfoil_api_key", lambda: "tk_fake")
+    sm._TINFOIL_CATALOG_CHECKED.clear()
+
+    def _boom(*a, **k):
+        raise OSError("network down")
+
+    monkeypatch.setattr(sm.requests, "get", _boom)
+    # Advisory only: a probe failure must never block summarization.
+    assert sm.verify_tinfoil_model("glm-5-3-flash") is None
+
+
+def test_probe_checks_each_model_once(monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(sm, "_resolve_tinfoil_api_key", lambda: "tk_fake")
+    sm._TINFOIL_CATALOG_CHECKED.clear()
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            calls["n"] += 1
+            return {"data": [{"id": "glm-5-3-flash"}]}
+
+    monkeypatch.setattr(sm.requests, "get", lambda *a, **k: _Resp())
+    sm.verify_tinfoil_model("glm-5-3-flash")
+    sm.verify_tinfoil_model("glm-5-3-flash")
+    assert calls["n"] == 1

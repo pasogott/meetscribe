@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.18.1 — fix: `confidential` preset model migration (GLM-5.2 → GLM-5.3 Flash)
+
+Tinfoil retired `glm-5-2` — the model behind the `confidential` TEE
+summarization preset — **with no deprecation notice**.  It disappeared
+from `/v1/models` and every request began returning HTTP 503 *"The engine
+is currently overloaded"*.  Because 503 was not classified as transient,
+and because `confidential` by design never falls back, every confidential
+job failed outright.  Last known-good run was 2026-09-10 21:57; the break
+was detected 2026-09-12.
+
+The preset now targets **GLM-5.3 Flash** (`glm-5-3-flash`), chosen over
+the higher-tier `glm-5-3` on evidence, not on vendor tier (see below).
+Three independent resilience fixes ship alongside so the next silent
+retirement degrades instead of failing.
+
+### Changed
+
+* **`confidential` preset → `glm-5-3-flash`.**  `DEFAULT_TINFOIL_MODEL`
+  and `SUMMARY_PRESETS["confidential"]` in `millet/summarize.py`, the GUI
+  preset dropdown label, and the docs (README, REQUIREMENTS) now
+  reference GLM-5.3 Flash.  No API, CLI-flag, or config change.
+
+  Evaluated via millet's real two-pass code path on 6 real meetings
+  (3 EN, 1 DE, 1 TR, 1 narrated screen recording; 3.5 KB–165 KB
+  transcripts), scored against the on-disk `glm-5-2` and
+  `claude-sonnet-4-6` baselines.  Metrics only — no transcript content.
+
+  | metric | `glm-5-2` (old) | `glm-5-3-flash` (new) | `glm-5-3` |
+  |---|---|---|---|
+  | format compliance | 5/5 | 5/5 | 5/5 |
+  | DE/TR localized headers | yes | yes | yes |
+  | coverage vs baseline | — | **equal or better** | equal or better |
+  | cost / meeting (17.8K-token input) | ~$0.009 | **~$0.02** | ~$0.18 |
+  | latency (same input) | ~17 s | **64 s** | 193 s |
+  | reasoning tokens (same input) | — | 8,422 | 23,011 |
+  | image input | no | **yes** | no |
+
+  `glm-5-3` scores higher on Tinfoil's published intelligence metric
+  (45 vs 42), but that did not translate into better meeting summaries:
+  on head-to-head runs GLM-5.3 Flash matched or beat it on bullet
+  coverage (77 vs 76, 22 vs 20) while spending 8.9× less and running 3×
+  faster.  The extra intelligence is spent on reasoning tokens we pay
+  for.  Flash also leaves 3.2× timeout headroom against the 600 s cap
+  versus 1.8× — which matters on a preset that cannot fall back.
+
+* **README cost figures corrected.**  The documented "~$0.009/meeting"
+  predated reasoning-token billing and was ~2× low for Flash (and would
+  have been ~20× low for `glm-5-3`).
+
+### Fixed
+
+* **HTTP 503 is now classified as transient** (`_is_transient_network_error`).
+  A drained enclave pool is a capacity problem and retries with backoff
+  (3 attempts).  A 404 *"The model does not exist"* is deliberately **not**
+  retried — a retired model never comes back.
+
+* **Sibling TEE fallback.**  When the primary model's pool is unusable
+  (503/404) after exhausting retries, summarization retries once on
+  `DEFAULT_TINFOIL_FALLBACK_MODEL` (`deepseek-v4-1-flash`) — a different
+  model *family*, so a drained GLM pool cannot take out both.  This is
+  **not** a privacy fallback: both models run inside the TEE, so the
+  `confidential` contract holds exactly as before.  It is never silent —
+  the switch sets `fallback_used` and the actual model is recorded in
+  `.summary.meta.json`.  A DNS/router-discovery failure does *not* trigger
+  it (the whole service is unreachable; a sibling would fail identically).
+
+* **Catalog pre-flight probe** (`verify_tinfoil_model`).  Before the first
+  request for a given model, millet checks `/v1/models` and logs a loud
+  warning if the model is absent (retired) or carries `deprecated` /
+  `deprecationDate`.  Advisory only — it never raises and never blocks
+  summarization, and each model is checked at most once per process.
+  This probe reproduces the `glm-5-2` failure signature exactly and would
+  have caught this outage before a single job died.
+
+### Tests
+
+11 new tests (344 total, up from 333): 503/404 classification, pool-error
+vs service-error discrimination, sibling fallback on persistent 503,
+sibling *not* tried on DNS failure, sibling-family divergence guard, and
+6 catalog-probe cases (retired, deprecated, healthy, network failure,
+once-per-process caching).
+
 ## v0.18.0 — feat: `meetings_subdir` per-team sync target subdirectory
 
 ### Added

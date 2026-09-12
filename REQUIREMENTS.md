@@ -7,7 +7,7 @@ pyannote-audio for transcription and diarization, Ollama for AI
 summaries.  No cloud APIs needed for the local-first path.
 
 Cloud / TEE summary backends are **opt-in** alternatives (OpenRouter,
-Claude Max via local proxy, or GLM-5.2 inside a Tinfoil
+Claude Max via local proxy, or GLM-5.3 Flash inside a Tinfoil
 hardware-attested TEE).  See *Summary backends* and *Summarization
 presets* in the [README](README.md) for the trust model of each.
 

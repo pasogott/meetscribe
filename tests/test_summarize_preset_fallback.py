@@ -188,7 +188,7 @@ class TestEffectiveTemperature:
     def test_kimi_kseries_forced_to_1(self, model):
         assert _effective_temperature(model, 0.3) == 1.0
 
-    @pytest.mark.parametrize("model", ["gpt-4o-mini", "moonshot-v1-8k", "k3", "glm-5-2"])
+    @pytest.mark.parametrize("model", ["gpt-4o-mini", "moonshot-v1-8k", "k3", "glm-5-3-flash"])
     def test_other_models_keep_configured(self, model):
         assert _effective_temperature(model, 0.3) == 0.3
 

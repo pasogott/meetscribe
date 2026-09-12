@@ -23,6 +23,7 @@ Configuration precedence (highest to lowest):
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -56,7 +57,13 @@ CLAUDEMAX_HEALTH_URL = "http://localhost:3457/health"
 DEFAULT_OPENAI_COMPAT_MODEL = "gpt-4o-mini"
 
 # Tinfoil TEE defaults (hardware-enforced prompt privacy)
-DEFAULT_TINFOIL_MODEL = "glm-5-2"
+DEFAULT_TINFOIL_MODEL = "glm-5-3-flash"
+# Sibling TEE model tried when the primary model's enclave pool is
+# unavailable.  Deliberately a different model family (DeepSeek, not GLM) so
+# a drained GLM pool — exactly what retired glm-5-2 — does not take out both.
+# This is NOT a privacy fallback: both models run inside the TEE, so the
+# `confidential` contract holds.  It is never silent (see fallback_used).
+DEFAULT_TINFOIL_FALLBACK_MODEL = "deepseek-v4-1-flash"
 TINFOIL_API_KEY_ENV = "TINFOIL_API_KEY"
 _TINFOIL_KEY_FILE = Path.home() / "models" / "tinfoil" / "tinfoil.txt"
 
@@ -72,6 +79,64 @@ def _resolve_tinfoil_api_key() -> str | None:
         except OSError:
             pass
     return None
+
+
+# Catalog pre-flight: Tinfoil retires models out from under us (deepseek-v4-pro
+# in 2026-07, glm-5-2 in 2026-09 — the latter with no deprecation notice, it
+# simply stopped having an engine and started answering 503).  The catalog
+# endpoint self-documents both states, so check it once per process and warn
+# loudly rather than discovering the problem when a user's job dies.
+TINFOIL_MODELS_URL = "https://inference.tinfoil.sh/v1/models"
+_TINFOIL_CATALOG_CHECKED: set[str] = set()
+logger = logging.getLogger("millet.summarize")
+
+
+def verify_tinfoil_model(model: str, *, timeout: int = 10) -> str | None:
+    """Warn if ``model`` is missing from or deprecated in Tinfoil's catalog.
+
+    Returns a human-readable problem description, or None when the model
+    looks healthy.  Never raises and never blocks summarization: the
+    catalog is advisory, and a probe failure (offline, API blip) must not
+    take down a pipeline that would otherwise work.  Each model is checked
+    at most once per process.
+    """
+    if not model or model in _TINFOIL_CATALOG_CHECKED:
+        return None
+    _TINFOIL_CATALOG_CHECKED.add(model)
+
+    api_key = _resolve_tinfoil_api_key()
+    if not api_key:
+        return None
+    try:
+        resp = requests.get(
+            TINFOIL_MODELS_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        catalog = {m.get("id"): m for m in resp.json().get("data", [])}
+    except Exception as e:  # advisory probe, never fatal
+        logger.debug("Tinfoil catalog probe failed (ignored): %s", e)
+        return None
+
+    entry = catalog.get(model)
+    if entry is None:
+        problem = (
+            f"Tinfoil model {model!r} is not in the catalog "
+            f"({', '.join(sorted(k for k in catalog if k))}). "
+            "It has most likely been retired — requests will fail."
+        )
+    elif entry.get("deprecated"):
+        when = entry.get("deprecationDate") or "an unannounced date"
+        problem = (
+            f"Tinfoil model {model!r} is deprecated and will be removed on "
+            f"{when}. Migrate before then."
+        )
+    else:
+        return None
+
+    logger.warning("%s", problem)
+    return problem
 
 
 # Supported backends
@@ -122,7 +187,7 @@ def _preset_fallback_allowed(preset: str | None) -> bool:
 
 SUMMARY_PRESETS = {
     "high-quality": {"backend": "claudemax", "model": "claude-sonnet-4-6"},
-    "confidential": {"backend": "tinfoil", "model": "glm-5-2"},
+    "confidential": {"backend": "tinfoil", "model": "glm-5-3-flash"},
     "alternative": {"backend": "openrouter", "model": "moonshotai/kimi-k2.6"},
 }
 DEFAULT_PRESET = "high-quality"
@@ -1041,6 +1106,12 @@ def _is_transient_network_error(exc: BaseException) -> bool:
             return True
         cur = cur.__cause__ or cur.__context__
     # Last resort: match the SDK's router-discovery message + common DNS text.
+    #
+    # Server-side capacity errors (HTTP 503) are included: Tinfoil returns
+    # "The engine is currently overloaded, please try again later." when an
+    # enclave pool has no free capacity.  That is genuinely transient and
+    # worth a backoff retry — unlike a 404 "The model does not exist.",
+    # which means the model is gone and will never come back.
     msg = str(exc).lower()
     markers = (
         "failed to fetch router addresses",
@@ -1050,8 +1121,33 @@ def _is_transient_network_error(exc: BaseException) -> bool:
         "connection reset",
         "connection refused",
         "timed out",
+        "engine is currently overloaded",
+        "error code: 503",
+        "service unavailable",
     )
     return any(m in msg for m in markers)
+
+
+def _is_model_pool_error(exc: BaseException) -> bool:
+    """True if ``exc`` implicates one specific model rather than Tinfoil itself.
+
+    A drained/removed enclave pool answers 503 ("engine is currently
+    overloaded") or 404 ("the model does not exist").  Those are worth
+    retrying on a *sibling* TEE model.  A DNS/router-discovery failure, by
+    contrast, means the whole service is unreachable — a sibling would fail
+    identically, so it is not worth the extra round trip.
+    """
+    msg = str(exc).lower()
+    return any(
+        m in msg
+        for m in (
+            "engine is currently overloaded",
+            "error code: 503",
+            "service unavailable",
+            "does not exist",
+            "error code: 404",
+        )
+    )
 
 
 def _summarize_tinfoil(
@@ -1079,47 +1175,61 @@ def _summarize_tinfoil(
             "Get an API key at https://tinfoil.sh"
         )
 
+    # Advisory catalog check (once per model per process).  Surfaces a
+    # retired/deprecated model in the log before we spend a request on it.
+    verify_tinfoil_model(config.model)
+
     from tinfoil import TinfoilAI
 
-    t0 = time.time()
-    response = None
-
-    for attempt in range(1, _TINFOIL_MAX_ATTEMPTS + 1):
-        try:
-            # Client init does a network fetch (router discovery) — keep it
-            # inside the retry so a DNS blip here doesn't hard-fail.
-            client = TinfoilAI(api_key=api_key)
-            # timeout: the only backend call that previously omitted it —
-            # a stalled TLS connection to the enclave hung the whole
-            # pipeline indefinitely, worst for the `confidential` preset
-            # which (by design) has no fallback. The Tinfoil SDK is
-            # OpenAI-compatible and honors per-request timeouts.
-            response = client.chat.completions.create(
-                model=config.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=config.temperature,
-                timeout=config.timeout,
-            )
-            break
-        except Exception as e:
-            if attempt < _TINFOIL_MAX_ATTEMPTS and _is_transient_network_error(e):
-                wait = _TINFOIL_BACKOFF_BASE**attempt
-                import logging
-
-                logging.getLogger("millet.summarize").warning(
-                    "Tinfoil attempt %d/%d hit a transient network/DNS error; "
-                    "retrying in %.0fs: %s",
-                    attempt,
-                    _TINFOIL_MAX_ATTEMPTS,
-                    wait,
-                    e,
+    def _attempt(model: str):
+        """Call one TEE model with the retry/backoff budget. Raises on failure."""
+        for attempt in range(1, _TINFOIL_MAX_ATTEMPTS + 1):
+            try:
+                # Client init does a network fetch (router discovery) — keep it
+                # inside the retry so a DNS blip here doesn't hard-fail.
+                client = TinfoilAI(api_key=api_key)
+                # timeout: the only backend call that previously omitted it —
+                # a stalled TLS connection to the enclave hung the whole
+                # pipeline indefinitely, worst for the `confidential` preset
+                # which (by design) has no fallback. The Tinfoil SDK is
+                # OpenAI-compatible and honors per-request timeouts.
+                return client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=config.temperature,
+                    timeout=config.timeout,
                 )
-                time.sleep(wait)
-                continue
-            # Either out of attempts, or a non-transient (auth/model) error.
+            except Exception as e:
+                if attempt < _TINFOIL_MAX_ATTEMPTS and _is_transient_network_error(e):
+                    wait = _TINFOIL_BACKOFF_BASE**attempt
+                    logger.warning(
+                        "Tinfoil attempt %d/%d for %r hit a transient "
+                        "network/capacity error; retrying in %.0fs: %s",
+                        attempt,
+                        _TINFOIL_MAX_ATTEMPTS,
+                        model,
+                        wait,
+                        e,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+
+    t0 = time.time()
+    used_model = config.model
+    sibling_used = False
+    sibling = DEFAULT_TINFOIL_FALLBACK_MODEL
+
+    try:
+        response = _attempt(config.model)
+    except Exception as e:
+        # The primary model's enclave pool is unreachable or gone.  Try the
+        # sibling TEE model before giving up: still inside the TEE, so the
+        # privacy contract is intact, and it survives a single-pool outage.
+        if not _is_model_pool_error(e) or not sibling or sibling == config.model:
             if _is_transient_network_error(e):
                 raise RuntimeError(
                     "Tinfoil TEE unreachable after "
@@ -1128,17 +1238,35 @@ def _summarize_tinfoil(
                 ) from e
             raise RuntimeError(f"Tinfoil TEE API error: {e}") from e
 
+        logger.warning(
+            "Tinfoil model %r unusable (%s); falling back to sibling TEE "
+            "model %r. Still hardware-attested — privacy contract intact.",
+            config.model,
+            e,
+            sibling,
+        )
+        try:
+            response = _attempt(sibling)
+        except Exception as e2:
+            raise RuntimeError(
+                f"Tinfoil TEE API error: primary model {config.model!r} failed "
+                f"({e}) and sibling {sibling!r} also failed ({e2})"
+            ) from e2
+        used_model = sibling
+        sibling_used = True
+
     elapsed = time.time() - t0
     content = (response.choices[0].message.content or "").strip()
 
     if not content:
-        raise RuntimeError(f"Tinfoil returned an empty response for model '{config.model}'.")
+        raise RuntimeError(f"Tinfoil returned an empty response for model '{used_model}'.")
 
     return MeetingSummary(
         markdown=content,
-        model=f"{config.model} (TEE)",
+        model=f"{used_model} (TEE)",
         elapsed_seconds=elapsed,
         backend="tinfoil",
+        fallback_used=sibling_used,
     )
 
 

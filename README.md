@@ -26,7 +26,7 @@ app and produces diarized transcripts using WhisperX + pyannote-audio.
 Works fully offline with local models, or optionally use cloud APIs
 (OpenRouter, Claude Max) for higher-quality summaries.  A
 **summarization preset selector** picks one of three backends per run:
-`high-quality` (Sonnet 4.6), `confidential` (GLM-5.2 inside a
+`high-quality` (Sonnet 4.6), `confidential` (GLM-5.3 Flash inside a
 hardware-attested Tinfoil TEE — the prompts never leave the secure
 enclave, and the resulting PDF carries a red CONFIDENTIAL watermark on
 every page), or `alternative` (Kimi K2.6 via OpenRouter).
@@ -73,7 +73,7 @@ including browser-based meetings and standalone desktop clients.
   fallback is disabled so the chosen privacy/quality level is honored)
 - **Summarization presets** -- `--summary-preset high-quality |
   confidential | alternative` resolves to a `(backend, model)` pair;
-  the `confidential` preset routes to a Tinfoil TEE-attested GLM-5.2
+  the `confidential` preset routes to a Tinfoil TEE-attested GLM-5.3 Flash
   so prompts cannot be seen by the model provider or cloud
   operator
 - **CONFIDENTIAL PDF watermark** -- sessions summarized via the
@@ -495,7 +495,7 @@ millet supports five backends with automatic fallback:
 | `ollama` (default) | `ollama serve` + `ollama pull qwen3.5:9b` | Free | Good | Fully local |
 | `openrouter` | Set `OPENROUTER_API_KEY` | Pay-per-use | Excellent | Cloud (model-provider-visible) |
 | `claudemax` | Run claude-max-api-proxy on localhost:3457 | Claude Max subscription | Excellent | Cloud (Anthropic-visible) |
-| `tinfoil` | `pip install 'millet-pipeline[tee]'`, set `TINFOIL_API_KEY` (or drop a key file at `~/models/tinfoil/tinfoil.txt`) | ~$0.009/meeting | Excellent (GLM-5.2) | **Hardware-attested TEE — prompts not visible to provider/operator** |
+| `tinfoil` | `pip install 'millet-pipeline[tee]'`, set `TINFOIL_API_KEY` (or drop a key file at `~/models/tinfoil/tinfoil.txt`) | ~$0.02/meeting | Excellent (GLM-5.3 Flash) | **Hardware-attested TEE — prompts not visible to provider/operator** |
 | `openai` | Set `MILLET_OPENAI_BASE_URL` | Varies | Varies | Depends on endpoint |
 
 The `openai` backend works with any OpenAI-compatible API — Lemonade, LiteLLM,
@@ -505,7 +505,10 @@ The `tinfoil` backend runs inference inside a hardware-attested TEE (AMD
 SEV-SNP or Intel TDX, depending on the model).  The model provider can't
 see the prompts, the cloud operator can't see the prompts, and the
 integrity is checked against an attestation report on every request.
-~$0.009 per meeting; latency ~66 s for a 30-min recording on GLM-5.2.
+~$0.02 per meeting; latency ~60–90 s for a 30–60 min recording on
+GLM-5.3 Flash.  Cost scales with the model's reasoning tokens, not just
+transcript length — the non-Flash GLM-5.3 spends ~9× more for no
+measurable gain in summary coverage (see CHANGELOG v0.18.1).
 
 ```bash
 # Use OpenRouter
@@ -547,7 +550,7 @@ pair.  Set it via `--summary-preset` on `transcribe`, `run`, `label`,
 | Preset | Backend | Model | Use case |
 |---|---|---|---|
 | `high-quality` | `claudemax` | `claude-sonnet-4-6` | Default for users with a Claude Max subscription; highest summary quality |
-| `confidential` | `tinfoil` | `glm-5-2` | Meetings where prompts must not be retained or trained on; hardware-attested TEE |
+| `confidential` | `tinfoil` | `glm-5-3-flash` | Meetings where prompts must not be retained or trained on; hardware-attested TEE |
 | `alternative` | `openrouter` | `moonshotai/kimi-k2.6` | Cheapest cloud option (~$0.017/meeting); useful when claudemax credentials are unavailable |
 
 ```bash
