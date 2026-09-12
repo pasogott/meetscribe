@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/pretyflaco/millet/actions/workflows/ci.yml/badge.svg)](https://github.com/pretyflaco/millet/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/millet-pipeline.svg)](https://pypi.org/project/millet-pipeline/)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/millet-pipeline?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/millet-pipeline)
 
 > **Millet** is a meeting transcription, summarization, and PDF output
 > tool.  It's named after the Ottoman *millet system* — the legal
@@ -31,6 +32,37 @@ generic OpenAI endpoints) are gone, because a TEE model measurably
 out-summarized Sonnet 4.6 on grounded precision and recall across EN/DE/TR
 (see [the evaluation](docs/tee-summarization-evaluation.md)).  There is no
 longer a privacy/quality tradeoff to configure.
+
+## Status
+
+Alpha (**0.20.1**).  Full history in [CHANGELOG.md](CHANGELOG.md).
+
+Recent highlights:
+
+- **0.20.1** -- the default backend's SDK (`tinfoil`) is a base
+  dependency, not an optional extra.  A plain `pip install
+  millet-pipeline` can now summarize on its own default path.
+- **0.20.0** -- vision summarization: cue frames from a screen recording
+  are sent to the model with the transcript.
+- **0.19.0** -- the cloud summary backends were removed; every remaining
+  backend is private.  PDF gained a quiet attestation footer in place of
+  the blanket CONFIDENTIAL watermark.
+- **0.18.1** -- TEE default moved to `glm-5-3-flash` after the vendor
+  retired `glm-5-2`, with a sibling-model retry for a drained enclave.
+
+## Evaluations
+
+Two write-ups, deliberately labelled by how much they actually support:
+
+| Question | Evidence | Result |
+|---|---|---|
+| Can an in-TEE model replace Sonnet 4.6 as the default summarizer? | **Evaluation** -- 10 meetings (EN/DE/TR), blind relabeling, two independent in-TEE judges, 80 verdicts, mechanical 16-check bar | **Yes.** `glm-5-3-flash` beat Sonnet on precision *and* recall under both judges in every language; 16/16. [Full evaluation](docs/tee-summarization-evaluation.md) |
+| Does showing the model the screen surface defects the transcript cannot? | **Case study, n = 1** -- one session, 1 text-only + 3 vision runs | Screen-only defects appear that the text-only run surfaced none of; 2 of 5 reproduced in 3/3 runs. Not a general claim. [Case study](docs/vision-summarization-case-study.md) |
+
+The first is worth quoting; the second is worth reading before believing.
+Note what the evaluation found about *method*: all four models scored
+10/10 on format and language compliance, so structural metrics were a
+four-way tie and every real difference was in content.
 
 ## Works with any meeting app
 
@@ -68,18 +100,18 @@ including browser-based meetings and standalone desktop clients.
   English, German, Turkish, French, Spanish, Farsi, and 90+ other languages
 - **Speaker diarization** -- pyannote-audio identifies who said what, with
   automatic YOU/REMOTE labeling from the dual-channel signal
-- **AI meeting summaries** -- local LLMs via Ollama, or cloud APIs via
-  OpenRouter / Claude Max / Tinfoil TEE, with automatic fallback between
-  backends (preset-aware: when a preset is explicitly selected the
-  fallback is disabled so the chosen privacy/quality level is honored)
-- **Summarization presets** -- `--summary-preset high-quality |
-  confidential | alternative` resolves to a `(backend, model)` pair;
-  the `confidential` preset routes to a Tinfoil TEE-attested GLM-5.3 Flash
-  so prompts cannot be seen by the model provider or cloud
-  operator
-- **CONFIDENTIAL PDF watermark** -- sessions summarized via the
-  `tinfoil` backend get a red CONFIDENTIAL header + footer on every
-  page (auto-detected from `summary.backend`, survives relabeling)
+- **AI meeting summaries, private by default** -- a hardware-attested
+  Tinfoil TEE (`glm-5-3-flash`, the default) or a fully local Ollama
+  model.  Both are private, so the `tinfoil -> ollama` fallback chain can
+  degrade *quality* but never *confidentiality*
+- **Summarize from the screen** -- for a narrated screen recording, the
+  cue frames sampled from transcript timestamps are sent to the model
+  alongside the transcript, so an iteration plan can report what is
+  visibly wrong and not only what the narrator said aloud
+  (`--summary-template iteration-plan --summary-frames`)
+- **Attestation footer on the PDF** -- a TEE-backed summary carries a
+  quiet "Summarized in a hardware-attested TEE" footer recording the
+  backend and model
 - **Voiceprint speaker recognition** -- automatically identifies speakers
   across meetings using voice embedding profiles
 - **Meeting sync** -- push transcripts and summaries to any Git repository
@@ -98,8 +130,9 @@ including browser-based meetings and standalone desktop clients.
   `millet label`, `millet enroll`, `millet sync`, `millet ingest`,
   `millet download`, `millet translate`, `millet devices`, `millet check`
 - **Per-session folders** -- each recording gets its own organized directory
-- **Offline-first** -- after initial model download, core features work without
-  internet; cloud backends are optional upgrades
+- **Offline-first** -- after initial model download, transcription,
+  diarization and PDF output work without internet; summarization needs
+  either the TEE (network, private) or a local Ollama model (no network)
 
 ## Quick start
 
@@ -158,9 +191,6 @@ sudo dnf install ffmpeg pulseaudio-utils
 # From PyPI (recommended)
 pip install millet-pipeline
 
-# Optional: pull the Tinfoil TEE SDK to enable the Confidential preset
-pip install 'millet-pipeline[tee]'
-
 # From source
 git clone https://github.com/pretyflaco/millet
 cd millet
@@ -168,9 +198,13 @@ pip install -e .
 ```
 
 This creates the `millet` command in your PATH (the older `meet` command is
-kept as a deprecated alias).  The `[tee]` extra adds the `tinfoil` Python SDK
-(≈ 2 MB).  Set `TINFOIL_API_KEY` to use the `--summary-preset confidential`
-route; see *Summarization presets* below.
+kept as a deprecated alias).
+
+The `tinfoil` SDK behind the default TEE backend is a **base dependency**
+since 0.20.1 — no extra to remember.  Set `TINFOIL_API_KEY` to summarize in
+the enclave, or run fully locally with `--summary-backend ollama` and no key
+at all.  (`millet-pipeline[tee]` still resolves, as an empty no-op extra, so
+older install commands don't break.)
 
 ### 3. HuggingFace token (for speaker diarization)
 
@@ -253,6 +287,14 @@ Options:
 - `--no-summarize` -- skip AI summary generation
 - `--summary-backend ollama` -- summary backend (`tinfoil` default, or `ollama`)
 - `--summary-model <model>` -- model for summary (default: per-backend)
+- `--summary-template <name>` -- use a named summary template instead of the
+  default meeting summary (e.g. `iteration-plan` for a narrated walkthrough
+  of a build)
+- `--summary-frames` / `--no-summary-frames` -- send the session's cue frames
+  (`attachments/cue_HH-MM-SS.png`) to the model alongside the transcript, so
+  the summary can describe what is on screen.  Requires a vision-capable
+  model: only `glm-5-3-flash` is on the allowlist, and frames are dropped
+  with a warning for anything else (up to `MAX_FRAMES = 45`)
 - `--skip-alignment` -- skip word-level alignment (useful if alignment model is unavailable)
 - `--mixdown mono|dual|dual-diarize` -- stereo mixdown mode (default:
   `dual-diarize`). See *Dual-channel modes* below.
@@ -347,10 +389,13 @@ millet label --auto ~/meet-recordings/meeting-20260313-214133
 Options:
 - `--auto` -- auto-label using voice profiles (see [Voiceprint speaker recognition](#voiceprint-speaker-recognition))
 - `--no-audio` -- skip audio playback, just show text samples
-- `--no-summary` -- use find-and-replace instead of re-running Ollama
+- `--no-summary` -- use find-and-replace instead of re-running the summarizer
 - `--summary-backend` / `--summary-model` -- override summary backend and model for regeneration
+- `--summary-template <name>` -- regenerate using a named template
 - `--apply-json FILE` (or `-` for stdin) -- non-interactive labeling: apply a
-  `{"OLD_ID": "Name", ...}` map (or `{"labels": {...}}` envelope) and exit
+  `{"OLD_ID": "Name", ...}` map (or `{"labels": {...}}` envelope) and exit.
+  An **empty** map re-runs just the summary + PDF step, which is how vezir
+  produces a screen recording's summary after cue frames exist
 - `--update-profiles` -- with `--apply-json`, update voiceprint profiles from
   the confirmed labels
 - `--summary-language <code>` -- also emit a translated `.summary.<lang>.md`
@@ -569,7 +614,7 @@ are honored within that preset (e.g. `--summary-preset confidential
 
 ### Two-pass local summarization
 
-When the **ollama** backend is selected (the default), millet runs two
+When the **ollama** backend is selected, millet runs two
 LLM calls instead of one:
 
 1. **Pass 1 (extraction)** — pulls topics, actions, decisions, and open
@@ -762,7 +807,7 @@ spellings are honored for one more release with a `DeprecationWarning`):
 |----------|---------|
 | `MILLET_SUMMARY_BACKEND` | Default summary backend (`tinfoil` default, or `ollama`) |
 | `MILLET_SUMMARY_MODEL` | Default summary model for the chosen backend |
-| `MILLET_SUMMARY_PRESET` | Default preset (`high-quality`, `confidential`, `alternative`) |
+| `MILLET_SUMMARY_PRESET` | Deprecated. All three names resolve to the default; removed in 0.21.0 |
 | `MILLET_OLLAMA_SINGLEPASS` | Set to `1` to disable two-pass Ollama summarization |
 | `TINFOIL_API_KEY` | Required for the `tinfoil` backend (or a key file at `~/models/tinfoil/tinfoil.txt`) |
 | `HF_TOKEN` | HuggingFace token for pyannote diarization |
@@ -800,7 +845,7 @@ If you hit OOM errors:
                                                                                   |
                   [WhisperX: faster-whisper + wav2vec2 alignment + pyannote diarization]
                                                                                   |
-                                      [Ollama LLM summary]     [Diarized transcript]
+                                      [ LLM summary ]          [Diarized transcript]
                                               |                         |
                                         .summary.md          .txt / .srt / .json
                                               |                         |
@@ -814,7 +859,8 @@ simultaneously into a single stereo WAV file at 16 kHz.
 wav2vec2 forced alignment for word-level timestamps, and pyannote speaker
 diarization. Dual-channel energy analysis maps speakers to YOU or REMOTE.
 
-**Summarize**: Sends the transcript to a local Ollama model that extracts
+**Summarize**: Sends the transcript to the summary backend (TEE by
+default, or a local Ollama model) which extracts
 a structured summary.
 
 **PDF**: Combines the summary and full transcript into a professional
