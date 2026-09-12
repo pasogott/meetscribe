@@ -123,17 +123,17 @@ class TestDispatchTemplateRouting:
         """A fallback backend's rebuilt config must keep the template."""
         captured: list[SummaryConfig] = []
 
-        def fake_openrouter(system_prompt, user_prompt, config):
+        def fake_tinfoil(system_prompt, user_prompt, config):
             captured.append(config)
             return MeetingSummary(
                 markdown="x" * 500, model=config.model,
-                elapsed_seconds=1.0, backend="openrouter",
+                elapsed_seconds=1.0, backend="tinfoil",
             )
 
-        monkeypatch.setattr(sm, "_summarize_openrouter", fake_openrouter)
+        monkeypatch.setattr(sm, "_summarize_tinfoil", fake_tinfoil)
 
         cfg = SummaryConfig(backend="ollama", template="iteration-plan")
-        _dispatch("openrouter", "sys", "usr", cfg)
+        _dispatch("tinfoil", "sys", "usr", cfg)
         assert captured[0].template == "iteration-plan"
 
 

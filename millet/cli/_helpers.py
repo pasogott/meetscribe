@@ -49,7 +49,7 @@ def _generate_summary(
 ):
     """Generate an AI meeting summary. Returns MeetingSummary or None.
 
-    Supports multiple backends (claudemax, openrouter, ollama) via SummaryConfig.
+    Supports the private backends (tinfoil TEE, local ollama) via SummaryConfig.
     The fallback chain is handled inside summarize() — callers should not
     gate on is_backend_available().
 

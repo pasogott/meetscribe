@@ -159,3 +159,46 @@ class TestGeneratePdf:
         plain_path = tmp_path / "test_plain.pdf"
         generate_pdf(transcript, plain_path, language="en")
         assert result.stat().st_size >= plain_path.stat().st_size
+
+
+# ─── Attestation footer vs CONFIDENTIAL watermark (0.19.0) ─────────────────
+
+
+class TestAttestationVsConfidential:
+    """Before 0.19.0 a TEE-backed summary auto-stamped every page
+    CONFIDENTIAL in red.  Now that *every* summary is TEE-backed, stamping
+    them all would make the warning wallpaper, so a TEE summary gets a quiet
+    attestation footer and the red banner is caller opt-in only."""
+
+    @staticmethod
+    def _template(**kwargs):
+        from millet.pdf import _PDFDocTemplate
+
+        return _PDFDocTemplate("/dev/null", "t", **kwargs)
+
+    def test_tee_summary_is_attested_not_confidential(self, transcript, tmp_path):
+        from millet.summarize import MeetingSummary
+
+        summary = MeetingSummary(
+            markdown="## Overview\nA test meeting.",
+            model="glm-5-3-flash (TEE)",
+            elapsed_seconds=1.0,
+            backend="tinfoil",
+        )
+        out = tmp_path / "attested.pdf"
+        assert generate_pdf(transcript, out, summary=summary, language="en").exists()
+
+    def test_explicit_confidential_still_supported(self, transcript, tmp_path):
+        out = tmp_path / "conf.pdf"
+        result = generate_pdf(transcript, out, language="en", confidential=True)
+        assert result.exists()
+
+    def test_doc_template_accepts_both_flags(self):
+        doc = self._template(confidential=True, attested=True)
+        assert doc._confidential is True
+        assert doc._attested is True
+
+    def test_doc_template_defaults_off(self):
+        doc = self._template()
+        assert doc._confidential is False
+        assert doc._attested is False

@@ -281,15 +281,16 @@ class MeetRecorderWindow(Gtk.Window):
         preset_box.pack_start(preset_label, False, False, 0)
 
         self._preset_combo = Gtk.ComboBoxText()
+        # 0.19.0: the preset axis is retired.  Every backend is private now,
+        # so there is nothing to trade off and only the default is offered.
+        # Legacy ids still resolve (see SUMMARY_PRESETS) for saved configs.
         _PRESET_OPTIONS = [
-            ("high-quality", "High Quality \u2014 Sonnet 4.6"),
             ("confidential", "Confidential \u2014 GLM-5.3 Flash (TEE)"),
-            ("alternative",  "Alternative \u2014 Kimi K2.6"),
         ]
         for pid, plabel in _PRESET_OPTIONS:
             self._preset_combo.append(pid, plabel)
         # Set active from CLI arg, env var, or default
-        initial = self._summary_preset or "high-quality"
+        initial = self._summary_preset or "confidential"
         if not self._preset_combo.set_active_id(initial):
             self._preset_combo.set_active(0)
         def _on_preset_changed(combo):
@@ -298,7 +299,7 @@ class MeetRecorderWindow(Gtk.Window):
         self._preset_combo.connect("changed", _on_preset_changed)
         # Sync immediately — set_active_id() above fires before the handler
         # is connected, so self._summary_preset would stay None without this.
-        self._summary_preset = self._preset_combo.get_active_id() or "high-quality"
+        self._summary_preset = self._preset_combo.get_active_id() or "confidential"
         preset_box.pack_start(self._preset_combo, True, True, 0)
         vbox.pack_start(preset_box, False, False, 0)
 

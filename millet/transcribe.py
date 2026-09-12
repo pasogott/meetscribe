@@ -2949,7 +2949,7 @@ def post_process(
         output_dir:       Directory to write output files into.
         basename:         Stem for output filenames (e.g. "meeting-20260313-231509").
         summarize:        Whether to attempt AI summarization.
-        summary_backend:  Backend override ("ollama" or "openrouter"); None uses default.
+        summary_backend:  Backend override ("tinfoil" or "ollama"); None uses default.
         summary_model:    Model name override; None uses the per-backend default.
         progress_callback: Optional callable(str) for status/error messages.
 

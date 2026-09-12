@@ -470,10 +470,11 @@ class _PDFDocTemplate(BaseDocTemplate):
     """Custom doc template with header line and page-number footer."""
 
     def __init__(self, filename, title: str = "", *,
-                 confidential: bool = False, **kwargs):
+                 confidential: bool = False, attested: bool = False, **kwargs):
         super().__init__(filename, **kwargs)
         self._pdf_title = title
         self._confidential = confidential
+        self._attested = attested
 
         frame = Frame(
             _MARGIN_LEFT,
@@ -501,6 +502,17 @@ class _PDFDocTemplate(BaseDocTemplate):
             canvas.setFillColor(HexColor("#cc0000"))
             canvas.drawCentredString(
                 _PAGE_W / 2, _MARGIN_BOTTOM * 0.5 + 12, "CONFIDENTIAL"
+            )
+        elif self._attested:
+            # Since 0.19.0 every summary is produced in a TEE, so stamping
+            # each one CONFIDENTIAL in red would make the warning wallpaper.
+            # State the provenance quietly instead, and keep the red banner
+            # for sessions explicitly flagged sensitive by the caller.
+            canvas.setFont("Helvetica", 6.5)
+            canvas.setFillColor(_COLOR_TIMESTAMP)
+            canvas.drawCentredString(
+                _PAGE_W / 2, _MARGIN_BOTTOM * 0.5 + 11,
+                "Summarized in a hardware-attested TEE",
             )
 
         # Header: CONFIDENTIAL banner (if applicable)
@@ -540,8 +552,10 @@ def generate_pdf(
         title: Document title shown on the first page.
         language: Language code (e.g. "en", "de", "fa") for font and
             RTL selection.
-        confidential: If True, print "CONFIDENTIAL" in red on every
-            page header and footer (used for TEE-backed summaries).
+        confidential: If True, print "CONFIDENTIAL" in red on every page
+            header and footer.  Caller opt-in only since 0.19.0 — a
+            TEE-backed summary alone no longer triggers it (every summary
+            is TEE-backed now), it gets a quiet attestation footer instead.
 
     Returns:
         Path to the generated PDF file.
@@ -633,17 +647,19 @@ def generate_pdf(
         story.append(Paragraph(_escape_xml(raw_text), styles["transcript_text"]))
 
     # ── Build PDF ──
-    # Auto-detect confidential mode from summary backend
+    # A TEE-produced summary is *attested*, which is now the norm rather than
+    # an exception, so it earns a quiet footer.  The red CONFIDENTIAL banner
+    # is reserved for callers that explicitly ask for it.
     is_confidential = confidential
-    if not is_confidential and summary and getattr(summary, "backend", "") in (
-        "tinfoil", "tinfoil-tee",
-    ):
-        is_confidential = True
+    is_attested = bool(
+        summary and getattr(summary, "backend", "") in ("tinfoil", "tinfoil-tee")
+    )
 
     doc = _PDFDocTemplate(
         str(output_path),
         title=title,
         confidential=is_confidential,
+        attested=is_attested,
         pagesize=letter,
         leftMargin=_MARGIN_LEFT,
         rightMargin=_MARGIN_RIGHT,

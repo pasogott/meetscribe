@@ -23,13 +23,14 @@ and professional PDF output.
 
 Records dual-channel audio (your mic + system audio) from **any** meeting
 app and produces diarized transcripts using WhisperX + pyannote-audio.
-Works fully offline with local models, or optionally use cloud APIs
-(OpenRouter, Claude Max) for higher-quality summaries.  A
-**summarization preset selector** picks one of three backends per run:
-`high-quality` (Sonnet 4.6), `confidential` (GLM-5.3 Flash inside a
-hardware-attested Tinfoil TEE — the prompts never leave the secure
-enclave, and the resulting PDF carries a red CONFIDENTIAL watermark on
-every page), or `alternative` (Kimi K2.6 via OpenRouter).
+Works fully offline with local models, or summarizes inside a
+hardware-attested Tinfoil TEE where the prompts never leave the secure
+enclave.  **Every supported summary backend is private** — as of 0.19.0
+the cloud backends that could read your meetings (Claude Max, OpenRouter,
+generic OpenAI endpoints) are gone, because a TEE model measurably
+out-summarized Sonnet 4.6 on grounded precision and recall across EN/DE/TR
+(see [the evaluation](docs/tee-summarization-evaluation.md)).  There is no
+longer a privacy/quality tradeoff to configure.
 
 ## Works with any meeting app
 
@@ -250,7 +251,7 @@ Options:
 - `--min-speakers 2` / `--max-speakers 6` -- hint for number of speakers
 - `--no-diarize` -- skip speaker diarization
 - `--no-summarize` -- skip AI summary generation
-- `--summary-backend openrouter` -- summary backend (`ollama`, `openrouter`, `claudemax`, `openai`, `tinfoil`)
+- `--summary-backend ollama` -- summary backend (`tinfoil` default, or `ollama`)
 - `--summary-model <model>` -- model for summary (default: per-backend)
 - `--skip-alignment` -- skip word-level alignment (useful if alignment model is unavailable)
 - `--mixdown mono|dual|dual-diarize` -- stereo mixdown mode (default:
@@ -488,18 +489,19 @@ millet run --no-summarize
 
 ### Summary backends
 
-millet supports five backends with automatic fallback:
+millet supports two backends, both private, with automatic fallback:
 
 | Backend | Setup | Cost | Quality | Privacy |
 |---------|-------|------|---------|---------|
-| `ollama` (default) | `ollama serve` + `ollama pull qwen3.5:9b` | Free | Good | Fully local |
-| `openrouter` | Set `OPENROUTER_API_KEY` | Pay-per-use | Excellent | Cloud (model-provider-visible) |
-| `claudemax` | Run claude-max-api-proxy on localhost:3457 | Claude Max subscription | Excellent | Cloud (Anthropic-visible) |
-| `tinfoil` | `pip install 'millet-pipeline[tee]'`, set `TINFOIL_API_KEY` (or drop a key file at `~/models/tinfoil/tinfoil.txt`) | ~$0.02/meeting | Excellent (GLM-5.3 Flash) | **Hardware-attested TEE — prompts not visible to provider/operator** |
-| `openai` | Set `MILLET_OPENAI_BASE_URL` | Varies | Varies | Depends on endpoint |
+| `tinfoil` (default) | `pip install 'millet-pipeline[tee]'`, set `TINFOIL_API_KEY` (or drop a key file at `~/models/tinfoil/tinfoil.txt`) | ~$0.02/meeting | Excellent (GLM-5.3 Flash) | **Hardware-attested TEE — prompts not visible to provider/operator** |
+| `ollama` | `ollama serve` + `ollama pull qwen3.5:9b` | Free | Good | Fully local |
 
-The `openai` backend works with any OpenAI-compatible API — Lemonade, LiteLLM,
-vLLM, text-generation-webui, LocalAI, or any self-hosted endpoint.
+`claudemax`, `openrouter` and the generic `openai` backend were **removed in
+0.19.0**.  They were the only way meeting content reached a party that could
+read it, and they no longer bought any quality: in a blind, judged evaluation
+the TEE model beat Sonnet 4.6 on both precision and recall in every language
+tested.  A stale `MILLET_SUMMARY_BACKEND` naming one of them degrades to the
+default with a warning rather than failing your jobs.
 
 The `tinfoil` backend runs inference inside a hardware-attested TEE (AMD
 SEV-SNP or Intel TDX, depending on the model).  The model provider can't
@@ -511,18 +513,12 @@ transcript length — the non-Flash GLM-5.3 spends ~9× more for no
 measurable gain in summary coverage (see CHANGELOG v0.18.1).
 
 ```bash
-# Use OpenRouter
-millet run --summary-backend openrouter --summary-model anthropic/claude-sonnet-4.6
+# Default: TEE. Nothing to configure beyond the API key.
+export TINFOIL_API_KEY=tk_...
 
-# Use any OpenAI-compatible endpoint
-export MILLET_SUMMARY_BACKEND=openai
-export MILLET_OPENAI_BASE_URL=http://localhost:8000/v1
-export MILLET_SUMMARY_MODEL=your-model-name
-# Optional: export MILLET_OPENAI_API_KEY=your-key
-
-# Or set via environment variables
-export MILLET_SUMMARY_BACKEND=openrouter
-export MILLET_SUMMARY_MODEL=anthropic/claude-sonnet-4.6
+# Fully local instead (no API key, no network)
+export MILLET_SUMMARY_BACKEND=ollama
+export MILLET_SUMMARY_MODEL=qwen3.8:27b
 ```
 
 > Environment variables use the `MILLET_` prefix. The older `MEETSCRIBE_`
@@ -530,28 +526,33 @@ export MILLET_SUMMARY_MODEL=anthropic/claude-sonnet-4.6
 > `DeprecationWarning`.
 
 If the configured backend is unavailable, millet automatically tries the
-next one in the fallback chain: **claudemax → tinfoil → openrouter → ollama**.
-The `openai` backend is opt-in only and never participates in the fallback
-chain.
+next one in the fallback chain: **tinfoil → ollama**.  Both destinations are
+private, so unlike the pre-0.19.0 chain this cannot silently downgrade
+confidentiality — only quality.
 
-When a preset is explicitly selected (see *Summarization presets* below),
-this fallback is **disabled** for that run — the chosen preset's backend
-either succeeds or the whole summarization step fails loudly with a
-non-zero exit.  This protects the privacy/quality promise of the
-`confidential` preset (a silent tinfoil → claudemax fallback would defeat
-the entire point of choosing TEE-attested inference).
+Two narrower safety nets sit inside that:
 
-### Summarization presets
+- **Sibling TEE model.**  If the primary model's enclave pool is drained
+  (HTTP 503) or retired (404), millet retries once on a different TEE model
+  family before giving up.  Still attested; never silent (`fallback_used` is
+  recorded in the `.meta.json` sidecar).
+- **Explicit preset pins the backend.**  When `--summary-preset` is given,
+  fallback is disabled for that run: it either succeeds on the requested
+  backend or fails loudly with a non-zero exit.
 
-A preset is a friendly name that resolves to a concrete `(backend, model)`
-pair.  Set it via `--summary-preset` on `transcribe`, `run`, `label`,
-`gui`, or `ingest`, or via the `MILLET_SUMMARY_PRESET` env var.
+### Summarization presets (deprecated)
 
-| Preset | Backend | Model | Use case |
-|---|---|---|---|
-| `high-quality` | `claudemax` | `claude-sonnet-4-6` | Default for users with a Claude Max subscription; highest summary quality |
-| `confidential` | `tinfoil` | `glm-5-3-flash` | Meetings where prompts must not be retained or trained on; hardware-attested TEE |
-| `alternative` | `openrouter` | `moonshotai/kimi-k2.6` | Cheapest cloud option (~$0.017/meeting); useful when claudemax credentials are unavailable |
+Presets used to select between backends with different privacy and quality.
+With only private backends left there is nothing to trade off, so the three
+historical names are now **aliases for the default** and will be removed in
+0.21.0.  They keep working meanwhile so existing scripts and stored jobs
+don't break.
+
+| Preset | Resolves to | Status |
+|---|---|---|
+| `confidential` | `tinfoil` / `glm-5-3-flash` | Deprecated alias (the default) |
+| `high-quality` | `tinfoil` / `glm-5-3-flash` | Deprecated alias |
+| `alternative` | `tinfoil` / `glm-5-3-flash` | Deprecated alias |
 
 ```bash
 # Quick check of which preset is in effect
@@ -581,7 +582,7 @@ LLM calls instead of one:
 This dramatically improves format compliance and reduces hallucinations
 on 20B-class local models (`gpt-oss:20b`, `qwen3.6:27b`) compared to a
 single-pass call, at the cost of one additional LLM call (~30–90s extra).
-Cloud backends (claudemax, openrouter, openai) remain single-pass — they
+The Tinfoil backend remains single-pass — it
 already produce well-structured output in one shot.
 
 To opt out and use the previous single-pass behavior:
@@ -759,12 +760,10 @@ spellings are honored for one more release with a `DeprecationWarning`):
 
 | Variable | Purpose |
 |----------|---------|
-| `MILLET_SUMMARY_BACKEND` | Default summary backend (`ollama`, `openrouter`, `claudemax`, `openai`, `tinfoil`) |
+| `MILLET_SUMMARY_BACKEND` | Default summary backend (`tinfoil` default, or `ollama`) |
 | `MILLET_SUMMARY_MODEL` | Default summary model for the chosen backend |
 | `MILLET_SUMMARY_PRESET` | Default preset (`high-quality`, `confidential`, `alternative`) |
 | `MILLET_OLLAMA_SINGLEPASS` | Set to `1` to disable two-pass Ollama summarization |
-| `MILLET_OPENAI_BASE_URL` / `MILLET_OPENAI_API_KEY` | Endpoint + key for the `openai`-compatible backend |
-| `OPENROUTER_API_KEY` | Required for the `openrouter` backend |
 | `TINFOIL_API_KEY` | Required for the `tinfoil` backend (or a key file at `~/models/tinfoil/tinfoil.txt`) |
 | `HF_TOKEN` | HuggingFace token for pyannote diarization |
 | `MILLET_CONFIG_DIR` | Override the config dir (default `~/.config/meet`) |
@@ -847,7 +846,7 @@ export LD_LIBRARY_PATH=$HOME/.local/lib/cuda:$LD_LIBRARY_PATH
   transcripts dominated by very short low-information utterances ("yes",
   "okay") and may exceed the default 600s timeout on very large
   (>100 KB) non-English transcripts. For these cases configure a cloud
-  backend (claudemax / openrouter) — the fallback chain takes over
+  backend (tinfoil) — the fallback chain takes over
   automatically. See [docs/local-model-evaluation.md](docs/local-model-evaluation.md).
 
 ## FAQ

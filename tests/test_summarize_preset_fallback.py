@@ -1,9 +1,18 @@
-"""Tests for opt-in preset fallback (MILLET_SUMMARY_PRESET_FALLBACK),
-the MILLET_SUMMARY_FALLBACK_ORDER chain override, per-backend
-MILLET_OPENAI_MODEL resolution, and fallback provenance in the
-.summary.meta.json sidecar.
-"""
+"""Tests for backend resolution, the fallback chain, and preset aliasing.
 
+0.19.0 removed the non-private cloud backends (claudemax, openrouter,
+openai).  What used to be a privacy/quality tradeoff across five backends is
+now two private ones -- a hardware-attested TEE and local Ollama -- so:
+
+  - the preset axis is retired; the three historical names are kept as
+    aliases for the default so existing callers (vezir passes
+    --summary-preset on every job) and ~580 stored jobs keep working;
+  - MILLET_SUMMARY_PRESET_FALLBACK is gone, because the cloud backends it
+    existed to reach are gone.  An explicitly requested preset now always
+    fails loud rather than silently producing something else;
+  - stale environment config naming a removed backend must degrade with a
+    warning, not crash every job on a deployment that upgrades.
+"""
 from __future__ import annotations
 
 import json
@@ -12,84 +21,152 @@ import pytest
 
 from millet import summarize as sm
 from millet.summarize import (
+    BACKENDS,
     DEFAULT_FALLBACK_ORDER,
-    DEFAULT_OPENAI_COMPAT_MODEL,
+    DEFAULT_SUMMARY_BACKEND,
+    DEFAULT_TINFOIL_MODEL,
+    RETIRED_BACKENDS,
+    SUMMARY_PRESETS,
     MeetingSummary,
     SummaryConfig,
     _default_model_for_backend,
-    _effective_temperature,
-    _preset_fallback_allowed,
+    _resolve_backend,
     _resolve_fallback_order,
+    _resolve_model,
     summarize,
 )
 
-# ─── Fallback order resolution ─────────────────────────────────────────────
+# ─── Backend registry ──────────────────────────────────────────────────────
+
+
+class TestBackendRegistry:
+    def test_only_private_backends_remain(self):
+        assert set(BACKENDS) == {"tinfoil", "ollama"}
+
+    def test_retired_backends_rejected_when_explicit(self):
+        """An explicit backend= is a caller bug and must fail loudly."""
+        for name in RETIRED_BACKENDS:
+            with pytest.raises(ValueError, match="Unknown summary backend"):
+                SummaryConfig(backend=name)
+
+    def test_default_backend_is_the_tee(self):
+        assert DEFAULT_SUMMARY_BACKEND == "tinfoil"
+
+
+# ─── Stale environment config (upgrade path) ───────────────────────────────
+
+
+class TestRetiredBackendEnvDowngrade:
+    @pytest.mark.parametrize("retired", RETIRED_BACKENDS)
+    def test_env_naming_retired_backend_falls_back_to_default(
+        self, monkeypatch, retired, caplog
+    ):
+        """Deployments carry MEETSCRIBE_SUMMARY_BACKEND=claudemax in systemd
+        env files that outlive an upgrade.  Hard-failing there would turn a
+        version bump into an outage."""
+        monkeypatch.setattr(sm, "_WARNED_BACKENDS", set())
+        monkeypatch.setenv("MILLET_SUMMARY_BACKEND", retired)
+        with caplog.at_level("WARNING"):
+            assert _resolve_backend() == DEFAULT_SUMMARY_BACKEND
+        assert retired in caplog.text
+        assert "removed in 0.19.0" in caplog.text
+
+    def test_legacy_env_alias_also_downgraded(self, monkeypatch):
+        monkeypatch.setattr(sm, "_WARNED_BACKENDS", set())
+        monkeypatch.delenv("MILLET_SUMMARY_BACKEND", raising=False)
+        monkeypatch.setenv("MEETSCRIBE_SUMMARY_BACKEND", "claudemax")
+        assert SummaryConfig().backend == DEFAULT_SUMMARY_BACKEND
+
+    def test_warning_emitted_once_per_name(self, monkeypatch, caplog):
+        monkeypatch.setattr(sm, "_WARNED_BACKENDS", set())
+        monkeypatch.setenv("MILLET_SUMMARY_BACKEND", "claudemax")
+        with caplog.at_level("WARNING"):
+            _resolve_backend()
+            _resolve_backend()
+        assert caplog.text.count("removed in 0.19.0") == 1
+
+    def test_valid_backend_env_untouched(self, monkeypatch):
+        monkeypatch.setenv("MILLET_SUMMARY_BACKEND", "ollama")
+        assert _resolve_backend() == "ollama"
+
+
+class TestStaleOllamaModelGuard:
+    """Before 0.19.0 the default backend was ollama, so a bare
+    MILLET_SUMMARY_MODEL names an Ollama tag.  Sending that to the enclave
+    would 404 at request time."""
+
+    def test_ollama_tag_ignored_for_tee(self, monkeypatch, caplog):
+        monkeypatch.setattr(sm, "_WARNED_MODELS", set())
+        monkeypatch.setenv("MILLET_SUMMARY_MODEL", "qwen3.8:27b")
+        with caplog.at_level("WARNING"):
+            assert _resolve_model("tinfoil") == DEFAULT_TINFOIL_MODEL
+        assert "looks like an Ollama tag" in caplog.text
+
+    def test_ollama_tag_honored_for_ollama(self, monkeypatch):
+        monkeypatch.setenv("MILLET_SUMMARY_MODEL", "qwen3.8:27b")
+        assert _resolve_model("ollama") == "qwen3.8:27b"
+
+    def test_plain_model_name_still_honored_for_tee(self, monkeypatch):
+        monkeypatch.setattr(sm, "_WARNED_MODELS", set())
+        monkeypatch.setenv("MILLET_SUMMARY_MODEL", "deepseek-v4-1-flash")
+        assert _resolve_model("tinfoil") == "deepseek-v4-1-flash"
+
+    def test_env_model_does_not_leak_across_backends(self, monkeypatch):
+        monkeypatch.setenv("MILLET_SUMMARY_MODEL", "some-ollama-only:9b")
+        assert _default_model_for_backend("tinfoil") == DEFAULT_TINFOIL_MODEL
+
+
+# ─── Fallback chain ────────────────────────────────────────────────────────
 
 
 class TestResolveFallbackOrder:
     def test_default_when_unset(self, monkeypatch):
         monkeypatch.delenv("MILLET_SUMMARY_FALLBACK_ORDER", raising=False)
-        assert _resolve_fallback_order() == DEFAULT_FALLBACK_ORDER
-        assert "openai" not in _resolve_fallback_order()
+        order = _resolve_fallback_order()
+        assert order == DEFAULT_FALLBACK_ORDER
+        assert order == ("tinfoil", "ollama")
+
+    def test_every_destination_is_private(self):
+        """The chain must not be able to downgrade confidentiality."""
+        assert all(b in ("tinfoil", "ollama") for b in DEFAULT_FALLBACK_ORDER)
 
     def test_env_override(self, monkeypatch):
-        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "openai,ollama")
-        assert _resolve_fallback_order() == ("openai", "ollama")
+        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "ollama,tinfoil")
+        assert _resolve_fallback_order() == ("ollama", "tinfoil")
 
-    def test_unknown_and_duplicates_dropped(self, monkeypatch):
-        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "openai, bogus ,OPENAI,ollama")
-        assert _resolve_fallback_order() == ("openai", "ollama")
+    def test_retired_names_dropped_from_override(self, monkeypatch):
+        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "openai,claudemax,ollama")
+        assert _resolve_fallback_order() == ("ollama",)
 
     def test_all_invalid_falls_back_to_default(self, monkeypatch):
-        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "bogus,nope")
+        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "openai,bogus")
         assert _resolve_fallback_order() == DEFAULT_FALLBACK_ORDER
 
 
-# ─── Per-backend openai model resolution ───────────────────────────────────
+# ─── Preset aliasing ───────────────────────────────────────────────────────
 
 
-class TestOpenaiModelResolution:
-    def test_openai_model_env_honored(self, monkeypatch):
-        monkeypatch.setenv("MILLET_OPENAI_MODEL", "kimi-k3")
-        assert _default_model_for_backend("openai") == "kimi-k3"
+class TestPresetAliasing:
+    @pytest.mark.parametrize("preset", ["high-quality", "confidential", "alternative"])
+    def test_legacy_presets_still_accepted(self, preset):
+        """vezir passes these on every job; rejecting them breaks production."""
+        cfg = SummaryConfig(preset=preset)
+        assert cfg.backend == DEFAULT_SUMMARY_BACKEND
+        assert cfg.model == DEFAULT_TINFOIL_MODEL
 
-    def test_openai_model_env_default(self, monkeypatch):
-        monkeypatch.delenv("MILLET_OPENAI_MODEL", raising=False)
-        assert _default_model_for_backend("openai") == DEFAULT_OPENAI_COMPAT_MODEL
+    def test_all_presets_resolve_identically(self):
+        configs = {(v["backend"], v["model"]) for v in SUMMARY_PRESETS.values()}
+        assert len(configs) == 1
 
-    def test_summary_model_env_still_ignored_for_fallback(self, monkeypatch):
-        # The chain-wide MILLET_SUMMARY_MODEL must not leak into a fallback
-        # backend; only the per-backend MILLET_OPENAI_MODEL applies.
-        monkeypatch.setenv("MILLET_SUMMARY_MODEL", "some-ollama-only:9b")
-        monkeypatch.delenv("MILLET_OPENAI_MODEL", raising=False)
-        assert _default_model_for_backend("openai") == DEFAULT_OPENAI_COMPAT_MODEL
-
-
-# ─── Preset fallback gate ──────────────────────────────────────────────────
-
-
-class TestPresetFallbackAllowed:
-    @pytest.mark.parametrize("val", ["1", "true", "True", "YES", "on"])
-    def test_truthy_enables_non_confidential(self, monkeypatch, val):
-        monkeypatch.setenv("MILLET_SUMMARY_PRESET_FALLBACK", val)
-        assert _preset_fallback_allowed("high-quality") is True
-        assert _preset_fallback_allowed("alternative") is True
-
-    def test_confidential_never_falls_back(self, monkeypatch):
-        monkeypatch.setenv("MILLET_SUMMARY_PRESET_FALLBACK", "1")
-        assert _preset_fallback_allowed("confidential") is False
-
-    def test_unset_defaults_to_false(self, monkeypatch):
-        monkeypatch.delenv("MILLET_SUMMARY_PRESET_FALLBACK", raising=False)
-        assert _preset_fallback_allowed("high-quality") is False
-
-    def test_unknown_or_missing_preset(self, monkeypatch):
-        monkeypatch.setenv("MILLET_SUMMARY_PRESET_FALLBACK", "1")
-        assert _preset_fallback_allowed(None) is False
-        assert _preset_fallback_allowed("bogus") is False
+    def test_deprecated_preset_logs_once(self, monkeypatch, caplog):
+        monkeypatch.setattr(sm, "_WARNED_PRESETS", set())
+        with caplog.at_level("INFO"):
+            sm._warn_deprecated_preset("high-quality")
+            sm._warn_deprecated_preset("high-quality")
+        assert caplog.text.count("is deprecated") == 1
 
 
-# ─── summarize() dispatch behavior ─────────────────────────────────────────
+# ─── Preset never falls back ───────────────────────────────────────────────
 
 
 def _fake_summary(backend: str) -> MeetingSummary:
@@ -113,84 +190,47 @@ def _patch_backends(monkeypatch, available: set[str], failing: set[str]):
     monkeypatch.setattr(sm, "_dispatch", fake_dispatch)
 
 
-class TestSummarizePresetFallback:
-    def test_fallback_fires_when_enabled(self, monkeypatch):
+class TestPresetNeverFallsBack:
+    @pytest.mark.parametrize("preset", ["high-quality", "confidential", "alternative"])
+    def test_requested_preset_fails_loud(self, monkeypatch, preset):
+        """No preset falls back, and the opt-in env var is gone -- setting it
+        must not resurrect the behaviour."""
         monkeypatch.setenv("MILLET_SUMMARY_PRESET_FALLBACK", "1")
-        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "openai")
-        _patch_backends(monkeypatch, available={"claudemax", "openai"}, failing={"claudemax"})
-        cfg = SummaryConfig(preset="high-quality")
-        result = summarize("transcript text", cfg)
-        assert result.backend == "openai"
-        assert result.preset == "high-quality"
-        assert result.fallback_used is True
-
-    def test_no_fallback_by_default(self, monkeypatch):
-        monkeypatch.delenv("MILLET_SUMMARY_PRESET_FALLBACK", raising=False)
-        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "openai")
-        _patch_backends(monkeypatch, available={"claudemax", "openai"}, failing={"claudemax"})
-        cfg = SummaryConfig(preset="high-quality")
+        _patch_backends(monkeypatch, available={"tinfoil", "ollama"}, failing={"tinfoil"})
         with pytest.raises(RuntimeError, match="quota exhausted"):
-            summarize("transcript text", cfg)
+            summarize("transcript text", SummaryConfig(preset=preset))
 
-    def test_confidential_never_falls_back(self, monkeypatch):
-        monkeypatch.setenv("MILLET_SUMMARY_PRESET_FALLBACK", "1")
-        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "openai")
-        _patch_backends(monkeypatch, available={"tinfoil", "openai"}, failing={"tinfoil"})
-        cfg = SummaryConfig(preset="confidential")
-        with pytest.raises(RuntimeError, match="quota exhausted"):
-            summarize("transcript text", cfg)
-
-    def test_fallback_when_primary_unavailable(self, monkeypatch):
-        # Health check fails (e.g. proxy down): with the opt-in, the chain
-        # proceeds instead of raising the preset-unavailable error.
-        monkeypatch.setenv("MILLET_SUMMARY_PRESET_FALLBACK", "1")
-        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "openai")
-        _patch_backends(monkeypatch, available={"openai"}, failing=set())
-        cfg = SummaryConfig(preset="high-quality")
-        result = summarize("transcript text", cfg)
-        assert result.backend == "openai"
-        assert result.fallback_used is True
-
-    def test_primary_unavailable_raises_without_opt_in(self, monkeypatch):
-        monkeypatch.delenv("MILLET_SUMMARY_PRESET_FALLBACK", raising=False)
-        _patch_backends(monkeypatch, available={"openai"}, failing=set())
-        cfg = SummaryConfig(preset="high-quality")
-        with pytest.raises(RuntimeError, match="requires the 'claudemax' backend"):
-            summarize("transcript text", cfg)
-
-    def test_all_backends_failing_raises(self, monkeypatch):
-        monkeypatch.setenv("MILLET_SUMMARY_PRESET_FALLBACK", "1")
-        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "openai")
-        _patch_backends(
-            monkeypatch,
-            available={"claudemax", "openai"},
-            failing={"claudemax", "openai"},
-        )
-        cfg = SummaryConfig(preset="high-quality")
-        with pytest.raises(RuntimeError, match="All summary backends failed"):
-            summarize("transcript text", cfg)
+    def test_unavailable_primary_raises_with_actionable_message(self, monkeypatch):
+        _patch_backends(monkeypatch, available={"ollama"}, failing=set())
+        with pytest.raises(RuntimeError, match="requires the 'tinfoil' backend"):
+            summarize("transcript text", SummaryConfig(preset="confidential"))
 
     def test_primary_success_tags_result(self, monkeypatch):
-        monkeypatch.setenv("MILLET_SUMMARY_PRESET_FALLBACK", "1")
-        _patch_backends(monkeypatch, available={"claudemax"}, failing=set())
-        cfg = SummaryConfig(preset="high-quality")
-        result = summarize("transcript text", cfg)
-        assert result.backend == "claudemax"
-        assert result.preset == "high-quality"
+        _patch_backends(monkeypatch, available={"tinfoil"}, failing=set())
+        result = summarize("transcript text", SummaryConfig(preset="confidential"))
+        assert result.backend == "tinfoil"
+        assert result.preset == "confidential"
         assert result.fallback_used is False
 
 
-# ─── Kimi K-series temperature clamp ───────────────────────────────────────
+class TestUnpresettedFallback:
+    """Without a preset the chain still degrades -- but only between private
+    backends, so confidentiality is preserved either way."""
 
+    def test_falls_back_to_ollama_when_tee_unavailable(self, monkeypatch):
+        _patch_backends(monkeypatch, available={"ollama"}, failing=set())
+        result = summarize("transcript text", SummaryConfig(backend="tinfoil"))
+        assert result.backend == "ollama"
+        assert result.fallback_used is True
 
-class TestEffectiveTemperature:
-    @pytest.mark.parametrize("model", ["kimi-k3", "kimi-k2.6", "kimi-for-coding", "Kimi-K3"])
-    def test_kimi_kseries_forced_to_1(self, model):
-        assert _effective_temperature(model, 0.3) == 1.0
-
-    @pytest.mark.parametrize("model", ["gpt-4o-mini", "moonshot-v1-8k", "k3", "glm-5-3-flash"])
-    def test_other_models_keep_configured(self, model):
-        assert _effective_temperature(model, 0.3) == 0.3
+    def test_all_backends_failing_raises(self, monkeypatch):
+        _patch_backends(
+            monkeypatch,
+            available={"tinfoil", "ollama"},
+            failing={"tinfoil", "ollama"},
+        )
+        with pytest.raises(RuntimeError, match="All summary backends failed"):
+            summarize("transcript text", SummaryConfig(backend="tinfoil"))
 
 
 # ─── Meta sidecar provenance ───────────────────────────────────────────────
@@ -198,13 +238,13 @@ class TestEffectiveTemperature:
 
 class TestMetaSidecarProvenance:
     def test_meta_records_preset_and_fallback(self, tmp_path):
-        summary = _fake_summary("openai")
-        summary.preset = "high-quality"
+        summary = _fake_summary("tinfoil")
+        summary.preset = "confidential"
         summary.fallback_used = True
         summary.save(tmp_path, "session1")
         meta = json.loads((tmp_path / "session1.summary.meta.json").read_text(encoding="utf-8"))
-        assert meta["backend"] == "openai"
-        assert meta["preset"] == "high-quality"
+        assert meta["backend"] == "tinfoil"
+        assert meta["preset"] == "confidential"
         assert meta["fallback_used"] is True
 
     def test_meta_defaults_no_preset_no_fallback(self, tmp_path):

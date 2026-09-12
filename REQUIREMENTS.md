@@ -6,10 +6,11 @@ The default configuration runs entirely on your machine: WhisperX +
 pyannote-audio for transcription and diarization, Ollama for AI
 summaries.  No cloud APIs needed for the local-first path.
 
-Cloud / TEE summary backends are **opt-in** alternatives (OpenRouter,
-Claude Max via local proxy, or GLM-5.3 Flash inside a Tinfoil
-hardware-attested TEE).  See *Summary backends* and *Summarization
-presets* in the [README](README.md) for the trust model of each.
+The default summary backend is GLM-5.3 Flash inside a Tinfoil
+hardware-attested TEE (needs `TINFOIL_API_KEY`); local Ollama remains
+available for a fully offline path.  Both are private — the cloud backends
+that could read meeting content were removed in 0.19.0.  See *Summary
+backends* in the [README](README.md) for the trust model of each.
 
 ## Hardware
 

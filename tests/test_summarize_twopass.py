@@ -8,8 +8,8 @@ import pytest
 
 from millet import summarize as sm
 from millet.summarize import (
-    DEFAULT_CLAUDEMAX_MODEL,
-    DEFAULT_OPENROUTER_MODEL,
+    DEFAULT_OLLAMA_MODEL,
+    DEFAULT_TINFOIL_MODEL,
     MeetingSummary,
     SummaryConfig,
     _build_extract_system_prompt,
@@ -46,8 +46,8 @@ class TestFallbackModelResolution:
         # A user's MILLET_SUMMARY_MODEL (set for their chosen backend) must
         # not leak into a different fallback backend and fail the chain.
         monkeypatch.setenv("MILLET_SUMMARY_MODEL", "some-ollama-only:9b")
-        assert _default_model_for_backend("openrouter") == DEFAULT_OPENROUTER_MODEL
-        assert _default_model_for_backend("claudemax") == DEFAULT_CLAUDEMAX_MODEL
+        assert _default_model_for_backend("tinfoil") == DEFAULT_TINFOIL_MODEL
+        assert _default_model_for_backend("ollama") == DEFAULT_OLLAMA_MODEL
 
     def test_resolve_model_honors_env_for_chosen_backend(self, monkeypatch):
         monkeypatch.setenv("MILLET_SUMMARY_MODEL", "my-model:latest")

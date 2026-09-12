@@ -1,5 +1,89 @@
 # Changelog
 
+## v0.19.0 — BREAKING: private-only summarization (cloud backends removed)
+
+Meeting content no longer reaches any party that can read it.  The three
+non-private summary backends — `claudemax`, `openrouter`, and the generic
+`openai` endpoint — are **removed**.  What remains is a hardware-attested
+TEE (`tinfoil`, now the default) and fully local `ollama`.
+
+This is not a privacy-over-quality trade.  A blind, judged evaluation over
+10 real meetings found the TEE model **beat Sonnet 4.6 on both precision
+and recall, in every language tested** — so routing transcripts through a
+provider that can read them had stopped buying anything.  Full method and
+numbers in `docs/tee-summarization-evaluation.md`.
+
+| | `claude-sonnet-4-6` | `glm-5-3-flash` |
+|---|---|---|
+| precision | 94.5 / 95.3% | **98.3 / 98.7%** |
+| recall | 73.9 / 79.0% | **91.2 / 94.2%** |
+| hallucination | 1.1 / 0.6% | **0.1 / 0.2%** |
+| distortion | 4.3 / 4.1% | **1.6 / 1.1%** |
+
+(two figures = the two independent judges; both ranked the field identically)
+
+### Removed
+
+* **Backends `claudemax`, `openrouter`, `openai`** — along with
+  `_summarize_claudemax`, `_summarize_openrouter`, `_summarize_openai`,
+  `is_claudemax_available`, `_effective_temperature`, `_KIMI_KSERIES_RE`,
+  and the `DEFAULT_OPENROUTER_MODEL` / `DEFAULT_CLAUDEMAX_MODEL` /
+  `DEFAULT_OPENAI_COMPAT_MODEL` / `CLAUDEMAX_BASE_URL` /
+  `CLAUDEMAX_HEALTH_URL` / `OPENROUTER_BASE_URL` constants.  `millet/` now
+  has zero references to the `openai` Python package.
+* **`MILLET_SUMMARY_PRESET_FALLBACK`** — the opt-in existed to let a preset
+  reach a *cloud* backend when the primary was exhausted.  Those backends
+  are gone, so an explicitly requested preset now always fails loud.
+* **Env vars** `MILLET_OPENAI_BASE_URL`, `MILLET_OPENAI_API_KEY`,
+  `MILLET_OPENAI_MODEL`, `OPENROUTER_API_KEY` are no longer read.
+
+### Changed
+
+* **Default backend is now `tinfoil`** (was `ollama`), model
+  `glm-5-3-flash`.
+* **Fallback chain is `tinfoil → ollama`** (was
+  `claudemax → tinfoil → openrouter → ollama`).  Both destinations are
+  private, so the chain can degrade *quality* but never *confidentiality* —
+  which was the whole hazard of the old chain.
+* **Presets are deprecated, not removed.**  `high-quality`, `confidential`
+  and `alternative` all now resolve to the same default and will be deleted
+  in 0.21.0.  They must keep working meanwhile: vezir passes
+  `--summary-preset` on every job and ~580 stored jobs carry the names.
+  Using one logs an informational notice (once per name per process).
+* **PDF: attestation footer replaces the blanket CONFIDENTIAL watermark.**
+  Previously any TEE-backed summary stamped every page `CONFIDENTIAL` in
+  red.  Now that *every* summary is TEE-backed that would be wallpaper, so
+  a TEE summary gets a quiet grey "Summarized in a hardware-attested TEE"
+  footer, and the red banner is reserved for callers passing
+  `confidential=True`.
+* GUI preset dropdown offers only the default; CLI `--summary-backend`
+  choices are `tinfoil` / `ollama`.
+
+### Fixed (upgrade safety)
+
+Two ways this release could otherwise have broken every job on an existing
+deployment, both caught before shipping:
+
+* **Stale `MILLET_SUMMARY_BACKEND` / `MEETSCRIBE_SUMMARY_BACKEND` naming a
+  removed backend** no longer raises `ValueError` on every summarization.
+  Deployments keep these in systemd env files that outlive an upgrade
+  (saray had `MEETSCRIBE_SUMMARY_BACKEND=claudemax`), so it now degrades to
+  the default with a loud warning.  An *explicit* `backend=` argument still
+  raises — that is a caller bug, not stale config.
+* **Stale `MILLET_SUMMARY_MODEL` holding an Ollama tag** is no longer sent
+  to the enclave.  Before 0.19.0 the default backend was `ollama`, so a
+  bare `MILLET_SUMMARY_MODEL=qwen3.8:27b` was normal; with `tinfoil` as the
+  default that value would be rejected as a nonexistent model at request
+  time.  Ollama tags contain `:` and Tinfoil ids never do, so it is ignored
+  with a warning pointing at `MILLET_SUMMARY_BACKEND=ollama`.
+
+### Tests
+
+348 total (up from 344): the preset/fallback suite was rewritten around the
+new semantics (backend registry, stale-env downgrade, stale-model guard,
+private-only chain, preset aliasing, preset-never-falls-back), plus 4 new
+PDF tests covering attestation-vs-watermark.
+
 ## v0.18.1 — fix: `confidential` preset model migration (GLM-5.2 → GLM-5.3 Flash)
 
 Tinfoil retired `glm-5-2` — the model behind the `confidential` TEE

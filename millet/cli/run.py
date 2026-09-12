@@ -68,15 +68,15 @@ from ._helpers import (
     "--summary-preset",
     type=click.Choice(["high-quality", "confidential", "alternative"], case_sensitive=False),
     default=None,
-    help="Summarization quality/privacy preset. Overrides --summary-backend/--summary-model.",
+    help="DEPRECATED (removed in 0.21.0): all presets now resolve to the default private backend. Kept so existing scripts keep working.",
 )
 @click.option(
     "--summary-backend",
     type=click.Choice(
-        ["ollama", "openrouter", "claudemax", "openai", "tinfoil"], case_sensitive=False
+        ["tinfoil", "ollama"], case_sensitive=False
     ),
     default=None,
-    help="Summary backend (default: ollama, or MILLET_SUMMARY_BACKEND env var)",
+    help="Summary backend (default: tinfoil, or MILLET_SUMMARY_BACKEND env var)",
 )
 @click.option(
     "--summary-model",

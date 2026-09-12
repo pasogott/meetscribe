@@ -1,23 +1,27 @@
 """Meeting summary generation using LLMs.
 
-Supports multiple backends:
-  - claudemax:  Claude Sonnet via claude-max-api-proxy on localhost:3457
-                ($0 extra — uses existing Claude Max subscription).
-  - tinfoil:    Hardware-attested TEE inference (requires TINFOIL_API_KEY).
-  - openrouter: OpenRouter API (OpenAI-compatible, requires OPENROUTER_API_KEY).
-  - ollama:     Local Ollama server (free, fully local).
-  - openai:     Any OpenAI-compatible endpoint (opt-in; never in fallback).
+Every supported backend keeps meeting content private:
+  - tinfoil: Hardware-attested TEE inference (requires TINFOIL_API_KEY).
+             Prompts are encrypted into the enclave; neither the model
+             provider nor the cloud operator can read them.  Default.
+  - ollama:  Local Ollama server (free, fully local, never leaves the box).
 
-Fallback chain: claudemax -> tinfoil -> openrouter -> ollama (see
-FALLBACK_ORDER).  When the configured primary backend is unavailable, the
-system automatically tries the next backend in the fallback order.  The
-MILLET_SUMMARY_MODEL override applies to the user's chosen backend only; each
-fallback backend uses its own hardcoded default model.
+The non-private cloud backends (claudemax, openrouter, openai) were removed
+in 0.19.0.  A TEE model measurably out-summarized Sonnet 4.6 on grounded
+precision and recall across EN/DE/TR, so routing meeting content through a
+provider that can read it no longer bought anything -- see
+docs/tee-summarization-evaluation.md.
+
+Fallback chain: tinfoil -> ollama (see FALLBACK_ORDER).  Both destinations
+are private, so the chain cannot silently downgrade confidentiality.  An
+*explicitly requested* preset never falls back at all: it fails loud.
+Within the tinfoil backend, a drained enclave pool falls back once to a
+sibling TEE model (DEFAULT_TINFOIL_FALLBACK_MODEL) before giving up.
 
 Configuration precedence (highest to lowest):
   1. Explicit keyword arguments / CLI flags (--summary-backend, --summary-model)
   2. Environment variables (MILLET_SUMMARY_BACKEND, MILLET_SUMMARY_MODEL)
-  3. Hardcoded defaults (ollama / qwen3.5:9b)
+  3. Hardcoded defaults (tinfoil / glm-5-3-flash)
 """
 
 from __future__ import annotations
@@ -43,18 +47,6 @@ import requests
 DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_TIMEOUT = 600  # 10 minutes max
-
-# OpenRouter defaults
-DEFAULT_OPENROUTER_MODEL = "anthropic/claude-sonnet-4.6"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-
-# Claude Max API Proxy defaults
-DEFAULT_CLAUDEMAX_MODEL = "claude-sonnet-4-6"
-CLAUDEMAX_BASE_URL = "http://localhost:3457/v1"
-CLAUDEMAX_HEALTH_URL = "http://localhost:3457/health"
-
-# OpenAI-compatible generic endpoint defaults
-DEFAULT_OPENAI_COMPAT_MODEL = "gpt-4o-mini"
 
 # Tinfoil TEE defaults (hardware-enforced prompt privacy)
 DEFAULT_TINFOIL_MODEL = "glm-5-3-flash"
@@ -139,13 +131,21 @@ def verify_tinfoil_model(model: str, *, timeout: int = 10) -> str | None:
     return problem
 
 
-# Supported backends
-BACKENDS = ("ollama", "openrouter", "claudemax", "openai", "tinfoil")
+# Supported backends.  Both are private: tinfoil runs inside a hardware
+# attested TEE, ollama runs on your own machine.
+BACKENDS = ("ollama", "tinfoil")
 
-# Fallback order: try claudemax first, then tinfoil, openrouter, then ollama
-# (openai is not in the default fallback — it's opt-in only via explicit
-# config or via MILLET_SUMMARY_FALLBACK_ORDER, e.g. "openai,ollama")
-DEFAULT_FALLBACK_ORDER = ("claudemax", "tinfoil", "openrouter", "ollama")
+# Removed in 0.19.0 because the provider could read meeting content.  Kept
+# as a named set so stale environment config degrades with a warning instead
+# of crashing every job (see _resolve_backend).
+RETIRED_BACKENDS = ("claudemax", "openrouter", "openai")
+_WARNED_BACKENDS: set[str] = set()
+_WARNED_MODELS: set[str] = set()
+
+# Fallback order.  Both destinations are private, so the chain cannot
+# silently downgrade confidentiality the way the old claudemax/openrouter
+# chain could.
+DEFAULT_FALLBACK_ORDER = ("tinfoil", "ollama")
 # Backward-compatible alias for the historical default order.
 FALLBACK_ORDER = DEFAULT_FALLBACK_ORDER
 
@@ -153,10 +153,10 @@ FALLBACK_ORDER = DEFAULT_FALLBACK_ORDER
 def _resolve_fallback_order() -> tuple[str, ...]:
     """Resolve the fallback chain from MILLET_SUMMARY_FALLBACK_ORDER.
 
-    Comma-separated backend names (e.g. "openai,ollama").  Unknown or
+    Comma-separated backend names (e.g. "tinfoil,ollama").  Unknown or
     duplicate names are dropped; an empty/unset/invalid value falls back
     to the default order.  Availability gating still applies per backend,
-    so listing e.g. "openai" is a no-op unless MILLET_OPENAI_BASE_URL is set.
+    so listing "tinfoil" is a no-op without a TINFOIL_API_KEY.
     """
     raw = os.environ.get("MILLET_SUMMARY_FALLBACK_ORDER", "").strip()
     if not raw:
@@ -169,28 +169,38 @@ def _resolve_fallback_order() -> tuple[str, ...]:
     return tuple(order) or DEFAULT_FALLBACK_ORDER
 
 
-def _preset_fallback_allowed(preset: str | None) -> bool:
-    """True when an explicitly requested preset may fall back on failure.
+# ─── Summarization presets (deprecated) ─────────────────────────────────────
+# Presets used to select between backends of differing privacy and quality.
+# With only private backends left there is nothing to choose between, so the
+# three historical names are kept purely as aliases for the default and are
+# scheduled for removal in 0.21.0.  They must keep working meanwhile: vezir
+# passes --summary-preset on every job, and ~580 stored jobs carry the names.
 
-    Opt-in via MILLET_SUMMARY_PRESET_FALLBACK=1.  The "confidential"
-    preset NEVER falls back — a silent tinfoil→cloud fallback would
-    defeat the privacy contract, so it stays fail-loud regardless.
-    """
-    if not preset or preset not in SUMMARY_PRESETS or preset == "confidential":
-        return False
-    raw = os.environ.get("MILLET_SUMMARY_PRESET_FALLBACK", "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
-
-
-# ─── Summarization presets ──────────────────────────────────────────────────
-# Friendly names that map to backend+model pairs for the GUI/CLI dropdown.
+DEFAULT_SUMMARY_BACKEND = "tinfoil"
 
 SUMMARY_PRESETS = {
-    "high-quality": {"backend": "claudemax", "model": "claude-sonnet-4-6"},
-    "confidential": {"backend": "tinfoil", "model": "glm-5-3-flash"},
-    "alternative": {"backend": "openrouter", "model": "moonshotai/kimi-k2.6"},
+    "confidential": {"backend": DEFAULT_SUMMARY_BACKEND, "model": DEFAULT_TINFOIL_MODEL},
+    # Deprecated aliases -> identical config.
+    "high-quality": {"backend": DEFAULT_SUMMARY_BACKEND, "model": DEFAULT_TINFOIL_MODEL},
+    "alternative": {"backend": DEFAULT_SUMMARY_BACKEND, "model": DEFAULT_TINFOIL_MODEL},
 }
-DEFAULT_PRESET = "high-quality"
+DEPRECATED_PRESETS = ("high-quality", "alternative", "confidential")
+DEFAULT_PRESET = "confidential"
+
+
+def _warn_deprecated_preset(preset: str | None) -> None:
+    """Log once-per-name when a caller uses a retired preset name."""
+    if preset in DEPRECATED_PRESETS and preset not in _WARNED_PRESETS:
+        _WARNED_PRESETS.add(preset)
+        logger.info(
+            "summary preset %r is deprecated and now resolves to the default "
+            "(%s/%s); every backend is private, so the preset axis no longer "
+            "selects anything. It will be removed in 0.21.0.",
+            preset, DEFAULT_SUMMARY_BACKEND, DEFAULT_TINFOIL_MODEL,
+        )
+
+
+_WARNED_PRESETS: set[str] = set()
 
 # Backward-compatible aliases (referenced by translate command, etc.)
 DEFAULT_MODEL = DEFAULT_OLLAMA_MODEL
@@ -423,31 +433,42 @@ USER_PROMPT_TEMPLATE_LANG = _load_user_prompt_template_lang()
 
 
 def _resolve_backend() -> str:
-    """Resolve the default backend from env var or hardcoded default."""
+    """Resolve the default backend from env var or hardcoded default.
+
+    A retired backend name in the environment is downgraded to a warning
+    rather than an error.  Deployments carry ``MILLET_SUMMARY_BACKEND`` /
+    ``MEETSCRIBE_SUMMARY_BACKEND`` in systemd env files that outlive an
+    upgrade, and hard-failing every job on a stale env var would turn a
+    routine version bump into an outage.  An *explicit* ``backend=`` still
+    raises (see ``SummaryConfig.__post_init__``) -- that is a caller bug,
+    not stale config.
+    """
     from .paths import getenv_renamed
 
-    return getenv_renamed(
+    backend = getenv_renamed(
         "MILLET_SUMMARY_BACKEND",
         "MEETSCRIBE_SUMMARY_BACKEND",
-        default="ollama",
+        default=DEFAULT_SUMMARY_BACKEND,
     ).lower()
+    if backend in RETIRED_BACKENDS:
+        if backend not in _WARNED_BACKENDS:
+            _WARNED_BACKENDS.add(backend)
+            logger.warning(
+                "summary backend %r was removed in 0.19.0 (it could read your "
+                "meeting content); using %r instead. Drop the stale "
+                "MILLET_SUMMARY_BACKEND/MEETSCRIBE_SUMMARY_BACKEND setting.",
+                backend, DEFAULT_SUMMARY_BACKEND,
+            )
+        return DEFAULT_SUMMARY_BACKEND
+    return backend
 
 
 def _default_model_for_backend(backend: str) -> str:
     """Default model for a backend, ignoring the MILLET_SUMMARY_MODEL override.
 
     ``MILLET_SUMMARY_MODEL`` targets the user's *chosen* backend and must not
-    leak into a different fallback backend.  The openai-compatible backend is
-    the exception: it has no meaningful hardcoded default for arbitrary
-    endpoints, so it honors its own per-backend ``MILLET_OPENAI_MODEL`` env
-    var (e.g. "kimi-k3" for api.moonshot.ai) before the generic default.
+    leak into a different fallback backend.
     """
-    if backend == "openrouter":
-        return DEFAULT_OPENROUTER_MODEL
-    if backend == "claudemax":
-        return DEFAULT_CLAUDEMAX_MODEL
-    if backend == "openai":
-        return os.environ.get("MILLET_OPENAI_MODEL", "").strip() or DEFAULT_OPENAI_COMPAT_MODEL
     if backend == "tinfoil":
         return DEFAULT_TINFOIL_MODEL
     return DEFAULT_OLLAMA_MODEL
@@ -458,13 +479,28 @@ def _resolve_model(backend: str) -> str:
 
     The ``MILLET_SUMMARY_MODEL`` env override applies to the user's *chosen*
     backend only.  For fallback backends (see :func:`_default_model_for_backend`)
-    the env model must be ignored — a model name valid for e.g. Ollama would
-    otherwise be forced onto OpenRouter/claudemax and fail the whole chain.
+    the env model must be ignored — an Ollama model name would otherwise be
+    forced onto Tinfoil and fail the whole chain.
     """
     from .paths import getenv_renamed
 
     env_model = getenv_renamed("MILLET_SUMMARY_MODEL", "MEETSCRIBE_SUMMARY_MODEL")
     if env_model:
+        # Upgrade guard: before 0.19.0 the default backend was ollama, so a
+        # bare MILLET_SUMMARY_MODEL almost always names an Ollama model.  Now
+        # that tinfoil is the default, that stale value would be sent to the
+        # enclave and rejected with 404 "model does not exist" at request
+        # time.  Ollama tags carry a ":" (qwen3.8:27b); Tinfoil ids never do.
+        if backend == "tinfoil" and ":" in env_model:
+            if env_model not in _WARNED_MODELS:
+                _WARNED_MODELS.add(env_model)
+                logger.warning(
+                    "MILLET_SUMMARY_MODEL=%r looks like an Ollama tag but the "
+                    "backend is %r; ignoring it and using %r. Set "
+                    "MILLET_SUMMARY_BACKEND=ollama to keep using that model.",
+                    env_model, backend, DEFAULT_TINFOIL_MODEL,
+                )
+            return DEFAULT_TINFOIL_MODEL
         return env_model
     return _default_model_for_backend(backend)
 
@@ -492,26 +528,22 @@ def _resolve_ollama_singlepass() -> bool:
 class SummaryConfig:
     """Configuration for meeting summary generation.
 
-    Supports multiple backends. The ``backend`` and ``model`` fields
+    Supports two private backends. The ``backend`` and ``model`` fields
     respect environment variables when left at their sentinel values:
 
-        MILLET_SUMMARY_BACKEND      -> backend  (default: "ollama")
+        MILLET_SUMMARY_BACKEND      -> backend  (default: "tinfoil")
         MILLET_SUMMARY_MODEL        -> model    (default: per-backend)
         MILLET_SUMMARY_TEMPLATE     -> template (default: None = meeting summary)
-        OPENROUTER_API_KEY          -> required for openrouter backend
+        TINFOIL_API_KEY             -> required for the tinfoil backend
 
-    Operator-level fallback knobs (read at dispatch time, not stored here):
-        MILLET_SUMMARY_PRESET_FALLBACK=1  -> allow non-confidential presets
-            to fall back down the chain on failure (confidential never does)
-        MILLET_SUMMARY_FALLBACK_ORDER     -> comma-separated fallback chain
-            override (default: claudemax,tinfoil,openrouter,ollama)
-        MILLET_OPENAI_MODEL               -> default model for the generic
-            openai backend (e.g. "kimi-k3" for api.moonshot.ai)
+    Operator-level knob (read at dispatch time, not stored here):
+        MILLET_SUMMARY_FALLBACK_ORDER  -> comma-separated fallback chain
+            override (default: tinfoil,ollama)
     """
 
     backend: str | None = None  # None = resolve from env/default
     model: str | None = None  # None = resolve from env/default per backend
-    preset: str | None = None  # None = no preset; "high-quality"|"confidential"|"alternative"
+    preset: str | None = None  # None = no preset; deprecated legacy names alias the default
     template: str | None = None  # None = default meeting-summary prompts
     ollama_url: str = OLLAMA_BASE_URL
     timeout: int = DEFAULT_TIMEOUT
@@ -740,62 +772,27 @@ def list_models(url: str = OLLAMA_BASE_URL) -> list[str]:
 # ─── Backend availability checks ───────────────────────────────────────────
 
 
-def is_claudemax_available() -> bool:
-    """Check if the claude-max-api-proxy is running and healthy."""
-    try:
-        resp = requests.get(CLAUDEMAX_HEALTH_URL, timeout=3)
-        return resp.status_code == 200
-    except (requests.ConnectionError, requests.Timeout):
-        return False
-
-
 def is_backend_available(config: SummaryConfig | None = None) -> bool:
     """Check if the configured summary backend is reachable.
 
-    For claudemax: checks the local proxy health endpoint.
-    For openrouter: checks that OPENROUTER_API_KEY is set.
+    For tinfoil: checks that an API key is resolvable.
     For ollama: checks the local server.
     """
     if config is None:
         config = SummaryConfig()
 
-    if config.backend == "claudemax":
-        return is_claudemax_available()
-    elif config.backend == "openrouter":
-        return bool(os.environ.get("OPENROUTER_API_KEY"))
-    elif config.backend == "tinfoil":
+    if config.backend == "tinfoil":
         return bool(_resolve_tinfoil_api_key())
-    elif config.backend == "openai":
-        from .paths import getenv_renamed
-
-        return bool(
-            getenv_renamed(
-                "MILLET_OPENAI_BASE_URL",
-                "MEETSCRIBE_OPENAI_BASE_URL",
-            )
-        )
-    else:
-        return is_ollama_available(config.ollama_url)
+    return is_ollama_available(config.ollama_url)
 
 
 def _backend_not_available_message(config: SummaryConfig) -> str:
     """Return a user-friendly message when the backend is unavailable."""
-    if config.backend == "claudemax":
-        return (
-            "Claude Max API Proxy is not running at localhost:3457. "
-            "Start it with: systemctl --user start claude-max-proxy"
-        )
-    if config.backend == "openrouter":
-        return "OPENROUTER_API_KEY is not set. Export it or use --summary-backend ollama."
     if config.backend == "tinfoil":
         return (
             f"TINFOIL_API_KEY is not set and key file {_TINFOIL_KEY_FILE} "
-            "not found. Get an API key at https://tinfoil.sh"
-        )
-    if config.backend == "openai":
-        return (
-            "MILLET_OPENAI_BASE_URL is not set. "
-            "Export it with the base URL of your OpenAI-compatible API."
+            "not found. Get an API key at https://tinfoil.sh, or run fully "
+            "locally with --summary-backend ollama."
         )
     return f"Ollama is not running at {config.ollama_url}. Start it with: ollama serve"
 
@@ -985,71 +982,6 @@ def _summarize_ollama_twopass(
         pass2_seconds=t2,
         pass1_chars=len(extracted),
         extraction=extracted,
-    )
-
-
-# ─── OpenRouter backend ───────────────────────────────────────────────────
-
-
-def _summarize_openrouter(
-    system_prompt: str,
-    user_prompt: str,
-    config: SummaryConfig,
-) -> MeetingSummary:
-    """Send a summarization request to OpenRouter (OpenAI-compatible API)."""
-    import time
-
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "OPENROUTER_API_KEY environment variable is not set. "
-            "Export it or use --summary-backend ollama."
-        )
-
-    # Lazy import — only needed when openrouter is actually used
-    from openai import OpenAI
-
-    client = OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=api_key,
-    )
-
-    t0 = time.time()
-
-    # Kimi K2.6 burns all output tokens on hidden reasoning if not disabled,
-    # producing empty visible content.  Disable reasoning for known models.
-    extra_kwargs: dict = {}
-    if "kimi" in config.model.lower():
-        extra_kwargs["extra_body"] = {"reasoning": {"enabled": False}}
-
-    try:
-        response = client.chat.completions.create(
-            model=config.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=config.temperature,
-            timeout=config.timeout,
-            **extra_kwargs,
-        )
-    except Exception as e:
-        raise RuntimeError(f"OpenRouter API error: {e}") from e
-
-    elapsed = time.time() - t0
-    content = (response.choices[0].message.content or "").strip()
-
-    if not content:
-        raise RuntimeError(f"OpenRouter returned an empty response for model '{config.model}'.")
-
-    # Use a clean display name for the model (strip org prefix for display)
-    display_model = config.model.split("/")[-1] if "/" in config.model else config.model
-
-    return MeetingSummary(
-        markdown=content,
-        model=display_model,
-        elapsed_seconds=elapsed,
-        backend="openrouter",
     )
 
 
@@ -1270,147 +1202,6 @@ def _summarize_tinfoil(
     )
 
 
-# ─── Claude Max API Proxy backend ─────────────────────────────────────────
-
-
-def _summarize_claudemax(
-    system_prompt: str,
-    user_prompt: str,
-    config: SummaryConfig,
-) -> MeetingSummary:
-    """Send a summarization request to Claude Max API Proxy (OpenAI-compatible)."""
-    import time
-
-    if not is_claudemax_available():
-        raise ConnectionError(
-            "Claude Max API Proxy is not running at localhost:3457. "
-            "Start it with: systemctl --user start claude-max-proxy"
-        )
-
-    # Lazy import — only needed when claudemax is actually used
-    from openai import OpenAI
-
-    client = OpenAI(
-        base_url=CLAUDEMAX_BASE_URL,
-        api_key="not-needed",  # proxy doesn't require an API key
-    )
-
-    t0 = time.time()
-
-    try:
-        response = client.chat.completions.create(
-            model=config.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=config.temperature,
-            timeout=config.timeout,
-        )
-    except Exception as e:
-        raise RuntimeError(f"Claude Max API Proxy error: {e}") from e
-
-    elapsed = time.time() - t0
-    content = (response.choices[0].message.content or "").strip()
-
-    if not content:
-        raise RuntimeError(
-            f"Claude Max API Proxy returned an empty response for model '{config.model}'."
-        )
-
-    return MeetingSummary(
-        markdown=content,
-        model=config.model,
-        elapsed_seconds=elapsed,
-        backend="claudemax",
-    )
-
-
-# ─── Generic OpenAI-compatible backend ────────────────────────────────────
-
-
-# Kimi K-series reasoning models (kimi-k2, kimi-k3, kimi-for-coding, ...)
-# reject any sampling temperature other than 1 with HTTP 400
-# "invalid temperature: only 1 is allowed for this model".
-_KIMI_KSERIES_RE = re.compile(r"kimi-(k\d+|for-coding)", re.IGNORECASE)
-
-
-def _effective_temperature(model: str, temperature: float) -> float:
-    """Clamp temperature for models with a fixed-temperature server side."""
-    if _KIMI_KSERIES_RE.search(model or ""):
-        return 1.0
-    return temperature
-
-
-def _summarize_openai(
-    system_prompt: str,
-    user_prompt: str,
-    config: SummaryConfig,
-) -> MeetingSummary:
-    """Send a summarization request to any OpenAI-compatible API endpoint.
-
-    Configured via environment variables:
-        MILLET_OPENAI_BASE_URL  — required (e.g. http://localhost:8000/v1,
-                                  or https://api.moonshot.ai/v1 for Kimi)
-        MILLET_OPENAI_API_KEY   — optional (defaults to "not-needed")
-        MILLET_OPENAI_MODEL     — optional default model when none is
-                                  configured explicitly (e.g. "kimi-k3")
-    """
-    import time
-
-    from .paths import getenv_renamed
-
-    base_url = getenv_renamed("MILLET_OPENAI_BASE_URL", "MEETSCRIBE_OPENAI_BASE_URL")
-    if not base_url:
-        raise RuntimeError(
-            "MILLET_OPENAI_BASE_URL environment variable is not set. "
-            "Set it to the base URL of your OpenAI-compatible API."
-        )
-
-    api_key = getenv_renamed(
-        "MILLET_OPENAI_API_KEY",
-        "MEETSCRIBE_OPENAI_API_KEY",
-        default="not-needed",
-    )
-
-    from openai import OpenAI
-
-    client = OpenAI(
-        base_url=base_url,
-        api_key=api_key,
-    )
-
-    t0 = time.time()
-
-    try:
-        response = client.chat.completions.create(
-            model=config.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=_effective_temperature(config.model, config.temperature),
-            timeout=config.timeout,
-        )
-    except Exception as e:
-        raise RuntimeError(f"OpenAI-compatible API error ({base_url}): {e}") from e
-
-    elapsed = time.time() - t0
-    content = (response.choices[0].message.content or "").strip()
-
-    if not content:
-        raise RuntimeError(
-            f"OpenAI-compatible API returned an empty response for model '{config.model}'."
-        )
-
-    return MeetingSummary(
-        markdown=content,
-        model=config.model,
-        elapsed_seconds=elapsed,
-        backend="openai",
-    )
-
-
 # ─── Response validation ──────────────────────────────────────────────────
 
 # Patterns that indicate the "summary" is actually an error response from
@@ -1479,14 +1270,8 @@ def _dispatch(
     else:
         fallback_config = config
 
-    if backend == "claudemax":
-        result = _summarize_claudemax(system_prompt, user_prompt, fallback_config)
-    elif backend == "openrouter":
-        result = _summarize_openrouter(system_prompt, user_prompt, fallback_config)
-    elif backend == "tinfoil":
+    if backend == "tinfoil":
         result = _summarize_tinfoil(system_prompt, user_prompt, fallback_config)
-    elif backend == "openai":
-        result = _summarize_openai(system_prompt, user_prompt, fallback_config)
     else:
         # Ollama: prefer the two-pass flow unless explicitly opted out.  A
         # named summary template always uses the single-pass flow — the
@@ -1534,8 +1319,10 @@ def summarize(
 
     Dispatches to the appropriate backend based on ``config.backend``.
     If the configured backend is unavailable, automatically tries the
-    next backend in the fallback order (default: claudemax -> tinfoil ->
-    openrouter -> ollama; overridable via MILLET_SUMMARY_FALLBACK_ORDER).
+    next backend in the fallback order (default: tinfoil -> ollama;
+    overridable via MILLET_SUMMARY_FALLBACK_ORDER).  Both are private,
+    so the chain cannot downgrade confidentiality.  An explicitly
+    requested preset never falls back -- it fails loud.
 
     Args:
         transcript_text: The plain-text transcript (as produced by
@@ -1579,32 +1366,25 @@ def summarize(
     else:
         user_prompt = USER_PROMPT_TEMPLATE.format(transcript=transcript_text)
 
-    # When a preset was explicitly selected (e.g. "confidential"), the user
-    # chose a specific privacy/quality level.  Silently falling back to a
-    # different backend would violate that expectation — especially for the
-    # "confidential" preset where falling back to a trust-based provider
-    # defeats the purpose.  Fail loudly instead — unless the operator
-    # explicitly opted in to fallback for non-confidential presets via
-    # MILLET_SUMMARY_PRESET_FALLBACK=1 (e.g. claudemax exhausted -> Kimi).
-    preset_fallback = _preset_fallback_allowed(config.preset)
+    # An explicitly requested preset pins the backend: fail loud rather than
+    # quietly producing a summary from something the caller did not ask for.
+    # Since 0.19.0 every backend is private, so this is no longer a privacy
+    # guard -- it is a "you asked for X, you get X or an error" guard.  The
+    # MILLET_SUMMARY_PRESET_FALLBACK opt-in was removed with the cloud
+    # backends it existed to reach.
+    preset_fallback = False
     if config.preset and config.preset in SUMMARY_PRESETS:
+        _warn_deprecated_preset(config.preset)
         avail_config = SummaryConfig(
             backend=config.backend,
             ollama_url=config.ollama_url,
         )
         if not is_backend_available(avail_config):
             msg = _backend_not_available_message(avail_config)
-            preset_label = config.preset
-            if not preset_fallback:
-                raise RuntimeError(
-                    f"Summarization preset '{preset_label}' requires the "
-                    f"'{config.backend}' backend, but it is unavailable: {msg}\n"
-                    f"Set the required environment variable and try again."
-                )
-            _log(
-                f"Preset '{preset_label}' backend '{config.backend}' is "
-                f"unavailable: {msg} — preset fallback enabled, trying "
-                "fallback backends..."
+            raise RuntimeError(
+                f"Summarization preset '{config.preset}' requires the "
+                f"'{config.backend}' backend, but it is unavailable: {msg}\n"
+                f"Set the required environment variable and try again."
             )
 
     # Build the list of backends to try: configured first, then fallback order

@@ -575,7 +575,7 @@ def apply_labels(
             to SummaryConfig when regenerate_summary is True so the same
             preset guard semantics apply during relabel-driven summary
             regeneration as during the initial transcribe pass.
-        summary_backend: Backend override ("ollama" or "openrouter"); None uses default.
+        summary_backend: Backend override ("tinfoil" or "ollama"); None uses default.
         summary_model: Model name override; None uses the per-backend default.
         summary_language: Optional language override for the regenerated
             summary.  When set (e.g. "de"), the summary is generated in that
