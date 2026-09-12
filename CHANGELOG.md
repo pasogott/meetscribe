@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.20.1 — fix: the default backend's SDK ships by default
+
+`pip install millet-pipeline` could not summarize on its own default path.
+
+Two defects compounded.  `tinfoil` — the SDK behind
+`DEFAULT_SUMMARY_BACKEND` since 0.19.0 — was still declared only in the
+optional `[tee]` extra, a leftover from when `ollama` was the default and
+the TEE was the opt-in `confidential` preset.  And availability was decided
+by "is an API key resolvable?" alone, never checking that the package
+imports.
+
+So with a key set but no SDK the backend reported itself **available**, the
+run walked past the guard, and execution reached a bare
+`from tinfoil import TinfoilAI`:
+
+| situation | before | now |
+|---|---|---|
+| key + no SDK, no preset | `ModuleNotFoundError` caught, fell to ollama | skipped cleanly, falls to ollama |
+| key + no SDK + **preset** | **`ModuleNotFoundError` re-raised — hard crash** | readable error naming the fix |
+| no SDK, no ollama | `All summary backends failed. Last error: None` | names both causes |
+
+The preset row was the live path: `vezir[server]` pins `millet-pipeline`
+without the `[tee]` extra, and the Android client sends a preset on every
+upload.
+
+### Fixed
+
+- **`tinfoil>=0.12` moved from the `[tee]` extra into base dependencies.**
+  The default backend's SDK is no longer optional.  `[tee]` is kept as an
+  empty no-op extra so existing `millet-pipeline[tee]` install commands, CI
+  jobs and deploy scripts keep resolving instead of erroring on an unknown
+  extra.  ~700 KB plus its tree, negligible beside whisperx/torch, and only
+  server-side installs pull this package at all.
+- **`is_backend_available()` now also requires the SDK to import**
+  (`tinfoil_sdk_installed()`).  Availability must not report a backend as
+  usable when the import that drives it would fail.  Kept even though the
+  dependency is no longer optional: constraint files, partial upgrades and
+  pre-0.20.1 environments can all still lack it.
+- **`_backend_not_available_message()` distinguishes a missing SDK from a
+  missing key**, and names the command that fixes it.
+- **"No summary backend is available" replaces "Last error: None".**  When
+  every backend is skipped as unavailable nothing is ever dispatched, so
+  `last_error` stayed `None` and the final error named no cause at all.  It
+  now reports why each backend was skipped.
+
+### Tests
+
+527 passing (9 new in `tests/test_tinfoil_sdk_missing.py`: availability with
+and without SDK/key, message content for each cause, ollama fallback when
+the SDK is absent, the preset path failing readably rather than with an
+`ImportError`, and the all-unavailable message naming both causes).
+
 ## v0.20.0 — feat: summarize from what's on screen, not just what was said
 
 A narrated screen recording carries one PNG per transcript cue.  Those

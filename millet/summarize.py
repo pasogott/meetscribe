@@ -27,6 +27,7 @@ Configuration precedence (highest to lowest):
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import logging
 import os
@@ -848,23 +849,43 @@ def list_models(url: str = OLLAMA_BASE_URL) -> list[str]:
 # ─── Backend availability checks ───────────────────────────────────────────
 
 
+def tinfoil_sdk_installed() -> bool:
+    """Is the `tinfoil` SDK importable?
+
+    Base dependency since 0.20.1, so normally yes.  Still checked because an
+    environment can lack it — a constraints file that excludes it, a partial
+    upgrade, or a pre-0.20.1 install where it lived in the `[tee]` extra.
+    Availability must not report a backend as usable when the import that
+    drives it would fail (that turned a missing SDK into a ModuleNotFoundError
+    traceback mid-job instead of a readable message).
+    """
+    return importlib.util.find_spec("tinfoil") is not None
+
+
 def is_backend_available(config: SummaryConfig | None = None) -> bool:
     """Check if the configured summary backend is reachable.
 
-    For tinfoil: checks that an API key is resolvable.
+    For tinfoil: the SDK must be importable *and* an API key resolvable.
     For ollama: checks the local server.
     """
     if config is None:
         config = SummaryConfig()
 
     if config.backend == "tinfoil":
-        return bool(_resolve_tinfoil_api_key())
+        return tinfoil_sdk_installed() and bool(_resolve_tinfoil_api_key())
     return is_ollama_available(config.ollama_url)
 
 
 def _backend_not_available_message(config: SummaryConfig) -> str:
     """Return a user-friendly message when the backend is unavailable."""
     if config.backend == "tinfoil":
+        if not tinfoil_sdk_installed():
+            return (
+                "the 'tinfoil' SDK is not installed, so the default "
+                "hardware-attested TEE backend cannot be used. Install it with "
+                "`pip install --upgrade millet-pipeline`, or run fully locally "
+                "with --summary-backend ollama."
+            )
         return (
             f"TINFOIL_API_KEY is not set and key file {_TINFOIL_KEY_FILE} "
             "not found. Get an API key at https://tinfoil.sh, or run fully "
@@ -1572,14 +1593,20 @@ def summarize(
             backends_to_try.append(fb)
 
     last_error = None
+    unavailable: list[str] = []
     for backend in backends_to_try:
         # Check availability before attempting.  Carry the caller's ollama_url
         # so a custom Ollama server isn't reported unavailable just because the
         # probe defaulted to localhost.
         avail_config = SummaryConfig(backend=backend, ollama_url=config.ollama_url)
         if not is_backend_available(avail_config):
+            reason = _backend_not_available_message(avail_config)
+            # Keep the reason: if every backend is skipped this way nothing is
+            # ever dispatched, so last_error stays None and the final error
+            # would otherwise read "Last error: None" and name no cause.
+            unavailable.append(f"{backend}: {reason}")
             if backend == config.backend:
-                _log(f"{backend} is unavailable: {_backend_not_available_message(avail_config)}")
+                _log(f"{backend} is unavailable: {reason}")
             else:
                 _log(f"Fallback {backend} also unavailable, skipping...")
             continue
@@ -1629,5 +1656,11 @@ def summarize(
                 raise
             continue
 
-    # All backends failed
+    # All backends failed.  Distinguish "never reachable" from "tried and
+    # errored": if nothing was dispatched, the useful information is *why*
+    # each backend was skipped, not a null last error.
+    if last_error is None and unavailable:
+        raise RuntimeError(
+            "No summary backend is available. " + " | ".join(unavailable)
+        )
     raise RuntimeError(f"All summary backends failed. Last error: {last_error}")

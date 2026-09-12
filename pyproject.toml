@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "millet-pipeline"
-version = "0.20.0"
+version = "0.20.1"
 description = "Meeting transcription pipeline (diarization, AI summaries, PDF output) under the vezir ecosystem.  Builds on millet-record for capture.  Named after the Ottoman millet system.  Successor to meetscribe-offline."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,6 +43,15 @@ dependencies = [
     "click>=8.0",
     "reportlab>=4.0",
     "requests>=2.28",
+    # The default summary backend (DEFAULT_SUMMARY_BACKEND = "tinfoil") needs
+    # this SDK, so it is a base dependency, not an extra.  It lived in the
+    # optional `[tee]` extra until 0.20.1 -- a leftover from when `ollama` was
+    # the default and the TEE was the opt-in `confidential` preset.  Once
+    # 0.19.0 made the TEE the default, a plain `pip install millet-pipeline`
+    # could no longer summarize on its own default path.  ~700 KB of Python
+    # plus its dependency tree, negligible beside whisperx/torch, and only
+    # server-side installs pull this package at all.
+    "tinfoil>=0.12",
     # certifi is already a transitive dependency via requests +
     # huggingface_hub; listed explicitly because millet/__init__.py
     # imports it directly for the F3 SSL_CERT_FILE injection (see
@@ -89,7 +98,11 @@ millet = ["prompts/*.md"]
 [project.optional-dependencies]
 rtl = ["arabic-reshaper>=3.0", "python-bidi>=0.4"]
 mlx = ["mlx-whisper>=0.4.3"]
-tee = ["tinfoil>=0.12"]
+# Kept as an empty no-op since 0.20.1: `tinfoil` moved into the base
+# dependencies when it became the default backend's SDK.  Existing
+# `millet-pipeline[tee]` install commands, CI jobs and deploy scripts keep
+# resolving instead of erroring on an unknown extra.
+tee = []
 # Parakeet ASR backend (NVIDIA Parakeet TDT via ONNX Runtime).  Pure-Python,
 # pulls onnx-asr + onnxruntime + huggingface-hub (NO torch / transformers).
 # English-only benchmark target; opt-in via --asr-backend parakeet.
