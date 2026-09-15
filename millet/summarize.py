@@ -51,10 +51,11 @@ import requests
 # when every attested TEE provider is unreachable it still produces a summary
 # on the operator's own hardware, so confidentiality never degrades (only
 # quality can).  To point it at a lighter/faster local model — e.g. NVIDIA's
-# Jetson-optimized Nemotron, which runs on ~12 GB VRAM — set
-# MILLET_SUMMARY_BACKEND=ollama MILLET_SUMMARY_MODEL=nemotron-3-nano; no code
-# change is needed, and the default here only moves once a model is benchmarked
-# to win on this box.  NOTE the local tier is TEXT-ONLY: Ollama cannot load the
+# Jetson-optimized Nemotron, which fits ~12 GB VRAM — set MILLET_OLLAMA_MODEL
+# (e.g. nemotron-3-nano:4b) to point JUST the fallback floor at it without
+# touching the primary backend or this global default.  The global default here
+# stays qwen3.5:9b (broadly pulled) and only moves once a model is benchmarked
+# to win everywhere.  NOTE the local tier is TEXT-ONLY: Ollama cannot load the
 # separate mmproj vision weights the multimodal Nemotrons need, so it is
 # registered supports_vision=False and the frames (screen-recording) path is
 # never routed here — it stays on a vision-capable attested tier.
@@ -662,12 +663,18 @@ def _default_model_for_backend(backend: str) -> str:
 
     ``MILLET_SUMMARY_MODEL`` targets the user's *chosen* backend and must not
     leak into a different fallback backend.
+
+    The ollama *fallback* tier is special: it must name a model that is actually
+    pulled on the host, which differs per deployment.  ``MILLET_OLLAMA_MODEL``
+    overrides just this tier (e.g. saray sets it to ``nemotron-3-nano:4b``)
+    without touching the global default or leaking into the primary backend the
+    way ``MILLET_SUMMARY_MODEL`` would.
     """
     if backend == "tinfoil":
         return DEFAULT_TINFOIL_MODEL
     if backend in ATTESTED_BACKENDS:
         return str(ATTESTED_BACKENDS[backend]["model"])
-    return DEFAULT_OLLAMA_MODEL
+    return os.environ.get("MILLET_OLLAMA_MODEL", "").strip() or DEFAULT_OLLAMA_MODEL
 
 
 def _resolve_model(backend: str) -> str:
