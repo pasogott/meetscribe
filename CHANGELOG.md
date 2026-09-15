@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.21.0 — attested TEE fallbacks (Venice, NEAR) so Tinfoil is not a SPOF
+
+Summarization had exactly one attested provider: Tinfoil.  If its enclave
+router was unreachable the chain fell straight through to local Ollama —
+private, but a quality cliff and no attested network alternative in between.
+
+Two decorrelated TEE providers now sit between them.  The default fallback
+chain is `tinfoil → venice → near → ollama`.  Venice and NEAR are both
+Intel TDX + NVIDIA H100/H200 Confidential-Computing, OpenAI-compatible and
+self-serve, and run on different hardware/clouds than Tinfoil, so a
+Tinfoil-side outage no longer takes summarization off attested hardware.
+
+- **First-party attestation** (`millet/attestation.py`), verified against the
+  live providers 2026-09-15.  Both use the same Phala/dstack two-step flow: a
+  GET returns a document with an opaque `nvidia_payload`, which millet POSTs to
+  NVIDIA's Remote Attestation Service (NRAS v4).  millet then requires, from the
+  NVIDIA-signed EAT, `x-nvidia-overall-att-result == true` **and** that
+  `eat_nonce` equals the fresh nonce we sent (anti-replay).  Confirmed PASS on
+  `z-ai/glm-5.3-flash` (NEAR) and `e2ee-glm-5-3-flash` (Venice).  A failed
+  attestation is loud — it falls through to the next backend, never saves an
+  unverified result as attested.  Full Intel TDX quote / DCAP-chain validation
+  is a deliberate ceiling delegated to provider reference verifiers, not
+  hand-rolled here (see the module).
+- **TLS against a private CA.**  The openai SDK uses httpx, which honors
+  `SSL_CERT_FILE`; on server hosts that points at a private CA (saray's Caddy
+  internal CA), so every Venice/NEAR call failed with a misleading "Connection
+  error".  These are public endpoints, so the client is pinned to certifi's
+  public CA bundle explicitly.  (requests never hit this — it always uses
+  certifi.)
+- **Billing errors fail loud, not silent.**  Unpaid keys return HTTP 402
+  (NEAR `no_limit_configured`, Venice "Insufficient USD or Diem balance").  That
+  is classified as a billing error and raised with an "add credits" message —
+  not retried as a transient (which would just burn the budget), and clearly
+  distinct from an attestation fault.
+- **Vision-gating.**  A screen-recording (frames) job never falls back to a
+  text-only tier (NEAR, Ollama) — that would silently drop the images.
+  Such tiers are skipped as fallbacks for a frames job; it stays on a vision
+  tier (Tinfoil, or Venice's `e2ee-qwen3-vl-30b-a3b-p`) or fails loud.  Model
+  ids verified live: Venice attested models carry an `e2ee-` prefix
+  (`e2ee-glm-5-3-flash`); NEAR uses `z-ai/glm-5.3-flash`.
+- **Generic backend** `_summarize_attested_oai` drives both providers over
+  one OpenAI-compatible path; they differ only by the `ATTESTED_BACKENDS`
+  table (base URL, key env/file, models, attestation + catalog URLs).
+- **Catalog pre-flight** generalized (`verify_tinfoil_model` →
+  `verify_model(backend, model)`) so the model-check timer covers the new
+  providers too.
+- **Local tier (Nemotron), benchmarked.**  The Ollama tier is the zero-network
+  privacy floor.  `nemotron-3-nano:4b` (2.8 GB) was benchmarked on an RTX 3090
+  against the current default `qwen3.5:9b`: it fits the saray target (RTX 5070,
+  12 GB) with ~3.2 GB of weights, captured 6/6 key facts in a real summary, at
+  ~17 s vs qwen's ~12.6 s — an easy fit and fine quality for a last-resort tier.
+  Point the tier at it with `MILLET_SUMMARY_BACKEND=ollama
+  MILLET_SUMMARY_MODEL=nemotron-3-nano:4b` (no code change).  Note the 24 GB
+  `nemotron-3-nano:latest`/`:30b` Omni tags do NOT fit 12 GB — use `:4b`.  The
+  tier is text-only: Ollama cannot load the multimodal Nemotrons' mmproj vision
+  weights, so frames never route here.
+
+Keys: `VENICE_API_KEY` / `NEAR_AI_API_KEY` (env, then a 0600 key file,
+mirroring the Tinfoil key pattern).  Tests +9 (`test_attested_fallback.py`).
+
 ## v0.20.1 — fix: the default backend's SDK ships by default
 
 `pip install millet-pipeline` could not summarize on its own default path.

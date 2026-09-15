@@ -45,7 +45,19 @@ import requests
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 
-# Ollama defaults
+# Ollama defaults.
+#
+# The local backend is the zero-network privacy floor of the fallback chain:
+# when every attested TEE provider is unreachable it still produces a summary
+# on the operator's own hardware, so confidentiality never degrades (only
+# quality can).  To point it at a lighter/faster local model — e.g. NVIDIA's
+# Jetson-optimized Nemotron, which runs on ~12 GB VRAM — set
+# MILLET_SUMMARY_BACKEND=ollama MILLET_SUMMARY_MODEL=nemotron-3-nano; no code
+# change is needed, and the default here only moves once a model is benchmarked
+# to win on this box.  NOTE the local tier is TEXT-ONLY: Ollama cannot load the
+# separate mmproj vision weights the multimodal Nemotrons need, so it is
+# registered supports_vision=False and the frames (screen-recording) path is
+# never routed here — it stays on a vision-capable attested tier.
 DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_TIMEOUT = 600  # 10 minutes max
@@ -64,15 +76,74 @@ _TINFOIL_KEY_FILE = Path.home() / "models" / "tinfoil" / "tinfoil.txt"
 
 def _resolve_tinfoil_api_key() -> str | None:
     """Resolve Tinfoil API key from env var or standard key file."""
-    key = os.environ.get(TINFOIL_API_KEY_ENV)
+    return _resolve_api_key(TINFOIL_API_KEY_ENV, _TINFOIL_KEY_FILE)
+
+
+def _resolve_api_key(env_var: str, key_file: Path) -> str | None:
+    """Resolve an API key from an env var, falling back to a 0600 key file."""
+    key = os.environ.get(env_var)
     if key:
         return key.strip()
-    if _TINFOIL_KEY_FILE.exists():
+    if key_file.exists():
         try:
-            return _TINFOIL_KEY_FILE.read_text().strip()
+            return key_file.read_text().strip()
         except OSError:
             pass
     return None
+
+
+# ─── Attested OpenAI-compatible fallback backends (venice, near) ────────────
+#
+# Decorrelated TEE providers so Tinfoil is not a single point of failure.
+# Both speak the OpenAI API, so one generic path (_summarize_attested_oai)
+# drives them; they differ only in this table.  Before a summary from one is
+# badged "attested", millet.attestation.verify_attestation checks the
+# enclave's NVIDIA NRAS evidence + our freshness nonce itself (see that
+# module for the deliberate ceiling on full TDX-quote validation).
+#
+#   base_url        OpenAI-compatible endpoint
+#   key_env/file    API key (env var, then 0600 key file — Tinfoil pattern)
+#   model           default text model (GLM 5.3 flash equivalent)
+#   vision_model    model to use when frames are present; None = no vision
+#   attestation_url per-request attestation document endpoint ({model} filled)
+#   catalog_url     OpenAI /models list, for the model pre-flight
+#   confidentiality short provenance note on the trust model (recorded, honest)
+# Values below were verified against the live APIs on 2026-09-15 (see the
+# Phase-0 probe): base URLs, the exact model ids each provider serves, and the
+# attestation-endpoint shapes.  Venice's attested models carry an ``e2ee-``
+# prefix — the plain id 404s the attestation endpoint.  NEAR uses ``z-ai/``
+# (slash), Venice uses ``z-ai-`` / ``e2ee-`` (dashes); they are NOT the same
+# string as Tinfoil's ``glm-5-3-flash``, so no id collision to worry about.
+ATTESTED_BACKENDS: dict[str, dict[str, object]] = {
+    "venice": {
+        "base_url": "https://api.venice.ai/api/v1",
+        "key_env": "VENICE_API_KEY",
+        "key_file": Path.home() / "models" / "venice" / "api-key.txt",
+        "model": "e2ee-glm-5-3-flash",
+        "vision_model": "e2ee-qwen3-vl-30b-a3b-p",
+        "attestation_url": "https://api.venice.ai/api/v1/tee/attestation?model={model}",
+        "catalog_url": "https://api.venice.ai/api/v1/models",
+        "confidentiality": "e2ee-gateway-tls",  # gateway TLS terminates outside TEE; app-layer E2EE
+    },
+    "near": {
+        "base_url": "https://cloud-api.near.ai/v1",
+        "key_env": "NEAR_AI_API_KEY",
+        "key_file": Path.home() / "models" / "near" / "api-key.txt",
+        "model": "z-ai/glm-5.3-flash",
+        "vision_model": None,  # NEAR gateway advertises no vision here — text-only tier
+        "attestation_url": (
+            "https://cloud-api.near.ai/v1/attestation/report?model={model}&signing_algo=ecdsa"
+        ),
+        "catalog_url": "https://cloud-api.near.ai/v1/models",
+        "confidentiality": "tee-terminated-tls",  # direct-completions terminate TLS in the TEE
+    },
+}
+
+
+def _resolve_attested_api_key(backend: str) -> str | None:
+    """Resolve the API key for an attested OpenAI-compatible backend."""
+    cfg = ATTESTED_BACKENDS[backend]
+    return _resolve_api_key(str(cfg["key_env"]), cfg["key_file"])  # type: ignore[arg-type]
 
 
 # Catalog pre-flight: Tinfoil retires models out from under us (deepseek-v4-pro
@@ -133,6 +204,53 @@ def verify_tinfoil_model(model: str, *, timeout: int = 10) -> str | None:
     return problem
 
 
+_ATTESTED_CATALOG_CHECKED: set[str] = set()
+
+
+def verify_model(backend: str, model: str, *, timeout: int = 10) -> str | None:
+    """Advisory model pre-flight for any backend. Never raises, never blocks.
+
+    Delegates to the Tinfoil catalog check for tinfoil; for the attested
+    OpenAI-compatible backends it probes the provider's /models list once per
+    (backend, model) and warns if the model is absent — the same "retired out
+    from under us" guard the vezir-model-check timer relies on.  ollama has no
+    remote catalog, so it is a no-op there.
+    """
+    if backend == "tinfoil":
+        return verify_tinfoil_model(model, timeout=timeout)
+    if backend not in ATTESTED_BACKENDS or not model:
+        return None
+    key = f"{backend}:{model}"
+    if key in _ATTESTED_CATALOG_CHECKED:
+        return None
+    _ATTESTED_CATALOG_CHECKED.add(key)
+
+    cfg = ATTESTED_BACKENDS[backend]
+    api_key = _resolve_attested_api_key(backend)
+    if not api_key:
+        return None
+    try:
+        resp = requests.get(
+            str(cfg["catalog_url"]),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        ids = {m.get("id") for m in resp.json().get("data", [])}
+    except Exception as e:  # advisory probe, never fatal
+        logger.debug("%s catalog probe failed (ignored): %s", backend, e)
+        return None
+
+    if model not in ids:
+        problem = (
+            f"{backend} model {model!r} is not in the catalog — it may have "
+            "been retired; requests will fail."
+        )
+        logger.warning("%s", problem)
+        return problem
+    return None
+
+
 # ─── Vision (still frames alongside the transcript) ─────────────────────────
 
 # Models that accept image input.  Deliberately an allowlist of models we
@@ -140,7 +258,7 @@ def verify_tinfoil_model(model: str, *, timeout: int = 10) -> str | None:
 # flag is set for deepseek-v4-1-flash, whose vision endpoint answers 502 on
 # every request (verified 2026-09-12).  Trusting the catalog would turn a
 # frames run into a hard failure on the sibling fallback.
-VISION_MODELS = ("glm-5-3-flash",)
+VISION_MODELS = ("glm-5-3-flash", "qwen3-vl", "e2ee-qwen3-vl")
 
 # Per-frame cost is roughly 2.2k tokens at 880x1920, linear in frame count.
 # The cap bounds a pathological session rather than trimming a normal one
@@ -178,6 +296,20 @@ def model_supports_vision(model: str | None) -> bool:
     return bool(model) and any(model.startswith(m) for m in VISION_MODELS)
 
 
+def backend_supports_vision(backend: str) -> bool:
+    """True when a backend has any vision-capable model for the frames path.
+
+    The gate for routing screen-recording frames: text-only tiers (near,
+    ollama) return False, so a frames job is never silently downgraded to a
+    text-only summary on fallback — it stays on a vision tier or fails loud.
+    """
+    if backend == "tinfoil":
+        return True  # primary vision tier (glm-5-3-flash)
+    if backend in ATTESTED_BACKENDS:
+        return ATTESTED_BACKENDS[backend]["vision_model"] is not None
+    return False  # ollama local tier is text-only (mmproj vision unsupported)
+
+
 def discover_cue_frames(session_dir: Path) -> list[Path]:
     """Cue frames written next to a session, oldest cue first.
 
@@ -191,9 +323,9 @@ def discover_cue_frames(session_dir: Path) -> list[Path]:
         return []
 
 
-# Supported backends.  Both are private: tinfoil runs inside a hardware
-# attested TEE, ollama runs on your own machine.
-BACKENDS = ("ollama", "tinfoil")
+# Supported backends.  All are private: tinfoil/venice/near run inside a
+# hardware-attested TEE, ollama runs on your own machine.
+BACKENDS = ("ollama", "tinfoil", "venice", "near")
 
 # Removed in 0.19.0 because the provider could read meeting content.  Kept
 # as a named set so stale environment config degrades with a warning instead
@@ -202,10 +334,12 @@ RETIRED_BACKENDS = ("claudemax", "openrouter", "openai")
 _WARNED_BACKENDS: set[str] = set()
 _WARNED_MODELS: set[str] = set()
 
-# Fallback order.  Both destinations are private, so the chain cannot
-# silently downgrade confidentiality the way the old claudemax/openrouter
-# chain could.
-DEFAULT_FALLBACK_ORDER = ("tinfoil", "ollama")
+# Fallback order.  Every destination is private, so the chain cannot silently
+# downgrade confidentiality the way the old claudemax/openrouter chain could.
+# tinfoil (attested, vision) -> venice (attested, vision) -> near (attested,
+# text) -> ollama (local, text).  Vision-gating (see _dispatch) keeps a frames
+# job off the text-only tiers rather than silently dropping the images.
+DEFAULT_FALLBACK_ORDER = ("tinfoil", "venice", "near", "ollama")
 # Backward-compatible alias for the historical default order.
 FALLBACK_ORDER = DEFAULT_FALLBACK_ORDER
 
@@ -531,6 +665,8 @@ def _default_model_for_backend(backend: str) -> str:
     """
     if backend == "tinfoil":
         return DEFAULT_TINFOIL_MODEL
+    if backend in ATTESTED_BACKENDS:
+        return str(ATTESTED_BACKENDS[backend]["model"])
     return DEFAULT_OLLAMA_MODEL
 
 
@@ -873,6 +1009,12 @@ def is_backend_available(config: SummaryConfig | None = None) -> bool:
 
     if config.backend == "tinfoil":
         return tinfoil_sdk_installed() and bool(_resolve_tinfoil_api_key())
+    if config.backend in ATTESTED_BACKENDS:
+        # OpenAI-compatible over HTTP: needs the openai SDK importable and a key.
+        return (
+            importlib.util.find_spec("openai") is not None
+            and bool(_resolve_attested_api_key(config.backend))
+        )
     return is_ollama_available(config.ollama_url)
 
 
@@ -890,6 +1032,17 @@ def _backend_not_available_message(config: SummaryConfig) -> str:
             f"TINFOIL_API_KEY is not set and key file {_TINFOIL_KEY_FILE} "
             "not found. Get an API key at https://tinfoil.sh, or run fully "
             "locally with --summary-backend ollama."
+        )
+    if config.backend in ATTESTED_BACKENDS:
+        cfg = ATTESTED_BACKENDS[config.backend]
+        if importlib.util.find_spec("openai") is None:
+            return (
+                f"the 'openai' SDK is not installed, so the {config.backend!r} "
+                "attested backend cannot be used."
+            )
+        return (
+            f"{cfg['key_env']} is not set and key file {cfg['key_file']} not "
+            f"found; the {config.backend!r} attested backend is unavailable."
         )
     return f"Ollama is not running at {config.ollama_url}. Start it with: ollama serve"
 
@@ -1398,6 +1551,174 @@ def _summarize_tinfoil(
     )
 
 
+# ─── Generic attested OpenAI-compatible backend (venice, near) ─────────────
+
+
+def _encode_frames_content(user_prompt: str, frames: list[Path]) -> tuple[object, int]:
+    """Build an OpenAI multi-part user message with base64 image_url frames.
+
+    Returns (content, frames_sent).  Caller has already decided the model can
+    see (vision gating happens at dispatch), so this always attaches frames.
+    """
+    parts: list[dict] = [{"type": "text", "text": user_prompt}]
+    for p in frames:
+        try:
+            encoded = base64.b64encode(p.read_bytes()).decode("ascii")
+        except OSError as exc:
+            logger.warning("frames: skipping unreadable %s (%s)", p.name, exc)
+            continue
+        mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+        parts.append(
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
+        )
+    return parts, len(parts) - 1
+
+
+def _is_billing_error(exc: Exception) -> bool:
+    """True if an API error is an out-of-credits / billing rejection.
+
+    Verified live 2026-09-15: unpaid keys return HTTP 402 — NEAR
+    ``{"type":"no_limit_configured"}``, Venice ``"Insufficient USD or Diem
+    balance"``.  This must fail LOUD with cause (the operator has to add
+    credits), never be mistaken for a transient blip and silently retried.
+    """
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if status == 402:
+        return True
+    msg = str(exc).lower()
+    return any(
+        s in msg
+        for s in (
+            "402",
+            "insufficient",
+            "no_limit_configured",
+            "no spending limit",
+            "add credits",
+            "quota",
+            "billing",
+        )
+    )
+
+
+def _summarize_attested_oai(
+    backend: str,
+    system_prompt: str,
+    user_prompt: str,
+    config: SummaryConfig,
+) -> MeetingSummary:
+    """Summarize via an OpenAI-compatible attested TEE backend (venice/near).
+
+    Verifies the enclave's attestation (NVIDIA NRAS evidence + freshness nonce)
+    *before* sending any prompt, so meeting content only leaves the box once the
+    hardware is confirmed.  A failed attestation raises AttestationError and is
+    treated by summarize() like the Tinfoil attestation fault: fall through to
+    the next backend, never save an unverified result as attested.
+
+    Transient network errors are retried with the same budget/backoff as the
+    Tinfoil path; genuine auth/model errors fail fast.
+    """
+    import time
+
+    from millet.attestation import AttestationError, new_nonce, verify_attestation
+
+    cfg = ATTESTED_BACKENDS[backend]
+    api_key = _resolve_attested_api_key(backend)
+    if not api_key:
+        raise RuntimeError(
+            f"{cfg['key_env']} is not set and key file {cfg['key_file']} not "
+            f"found; cannot use the {backend!r} attested backend."
+        )
+
+    # Pick the vision model when frames are present (dispatch guarantees this
+    # backend has one before routing frames here); else the text model.
+    frames = config.frames or []
+    model = config.model
+    if frames and cfg["vision_model"]:
+        model = str(cfg["vision_model"])
+
+    # Advisory catalog pre-flight (once per model per process).
+    verify_model(backend, model)
+
+    # Attestation gate — verify the enclave before the prompt leaves.  Failure
+    # is loud and non-silent (AttestationError propagates to the fallback loop).
+    nonce = new_nonce()
+    attestation_url = str(cfg["attestation_url"]).format(model=model)
+    verify_attestation(attestation_url, api_key=api_key, nonce=nonce)
+
+    if frames:
+        content, frames_sent = _encode_frames_content(user_prompt, frames)
+    else:
+        content, frames_sent = user_prompt, 0
+
+    # TLS: these are PUBLIC endpoints, so verify against certifi's CA bundle.
+    # The openai SDK uses httpx, which honors SSL_CERT_FILE — and on server
+    # hosts that env var points at a private CA (e.g. saray's Caddy internal
+    # CA, verified 2026-09-15), which lacks public roots and makes every
+    # Venice/NEAR call fail with a misleading "Connection error" instead of
+    # the real response.  Pin the public bundle explicitly. (requests dodged
+    # this by always using certifi; httpx does not.)
+    import certifi
+    import httpx
+    from openai import OpenAI
+
+    client = OpenAI(
+        base_url=str(cfg["base_url"]),
+        api_key=api_key,
+        http_client=httpx.Client(verify=certifi.where()),
+    )
+
+    t0 = time.time()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content},
+                ],
+                temperature=config.temperature,
+                timeout=config.timeout,
+            )
+            break
+        except AttestationError:
+            raise
+        except Exception as e:
+            # Billing/credits: fail fast and LOUD with the real cause — retrying
+            # an out-of-credits key just wastes the budget, and the operator
+            # needs to know to add credits (not a transient blip).
+            if _is_billing_error(e):
+                raise RuntimeError(
+                    f"{backend} rejected the request for billing reasons "
+                    f"(add credits for this provider): {e}"
+                ) from e
+            if attempt < _TINFOIL_MAX_ATTEMPTS and _is_transient_network_error(e):
+                wait = _TINFOIL_BACKOFF_BASE**attempt
+                logger.warning(
+                    "%s attempt %d/%d hit a transient network error; retrying "
+                    "in %.0fs: %s",
+                    backend, attempt, _TINFOIL_MAX_ATTEMPTS, wait, e,
+                )
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"{backend} TEE API error: {e}") from e
+
+    elapsed = time.time() - t0
+    content_out = (response.choices[0].message.content or "").strip()
+    if not content_out:
+        raise RuntimeError(f"{backend} returned an empty response for model {model!r}.")
+
+    return MeetingSummary(
+        markdown=content_out,
+        model=f"{model} (TEE)",
+        elapsed_seconds=elapsed,
+        backend=backend,
+        fallback_used=False,
+        frames_used=frames_sent,
+    )
+
+
 # ─── Response validation ──────────────────────────────────────────────────
 
 # Patterns that indicate the "summary" is actually an error response from
@@ -1471,6 +1792,10 @@ def _dispatch(
 
     if backend == "tinfoil":
         result = _summarize_tinfoil(system_prompt, user_prompt, fallback_config)
+    elif backend in ATTESTED_BACKENDS:
+        result = _summarize_attested_oai(
+            backend, system_prompt, user_prompt, fallback_config
+        )
     else:
         # Ollama: prefer the two-pass flow unless explicitly opted out.  A
         # named summary template always uses the single-pass flow — the
@@ -1609,6 +1934,19 @@ def summarize(
                 _log(f"{backend} is unavailable: {reason}")
             else:
                 _log(f"Fallback {backend} also unavailable, skipping...")
+            continue
+
+        # Vision gate: a screen-recording (frames) job must not fall back to a
+        # text-only tier — that would silently drop the images and summarize
+        # blind.  Skip such a backend as a *fallback* only; the primary backend
+        # is left to its own text-only degradation (unchanged behavior).
+        if (
+            config.frames
+            and backend != config.backend
+            and not backend_supports_vision(backend)
+        ):
+            unavailable.append(f"{backend}: text-only, skipped for a frames job")
+            _log(f"Fallback {backend} is text-only; skipping (session has frames)...")
             continue
 
         # If this is a fallback, log it (with the model actually used)

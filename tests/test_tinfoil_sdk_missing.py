@@ -34,6 +34,17 @@ def with_key(monkeypatch):
     monkeypatch.setattr(sm, "_resolve_tinfoil_api_key", lambda: "tk-test")
 
 
+@pytest.fixture
+def no_attested_keys(monkeypatch):
+    """No venice/near keys configured — isolate the tinfoil->ollama path.
+
+    The attested TEE backends sit between tinfoil and ollama in the chain; a
+    test that pins tinfoil->ollama behavior must first establish they are
+    unavailable (their own keys unset), which is the default real-world state.
+    """
+    monkeypatch.setattr(sm, "_resolve_attested_api_key", lambda backend: None)
+
+
 class TestAvailability:
     def test_key_without_sdk_is_not_available(self, no_sdk, with_key):
         """The regression: a key alone used to be enough."""
@@ -76,7 +87,9 @@ class TestMessage:
 
 
 class TestEndToEnd:
-    def test_falls_back_to_ollama_when_sdk_missing(self, no_sdk, with_key, monkeypatch):
+    def test_falls_back_to_ollama_when_sdk_missing(
+        self, no_sdk, with_key, no_attested_keys, monkeypatch
+    ):
         """No preset requested: the private local backend takes over."""
         monkeypatch.setattr(sm, "is_ollama_available", lambda url: True)
         monkeypatch.setattr(
@@ -106,7 +119,9 @@ class TestEndToEnd:
         assert "not installed" in str(exc.value)
         assert not isinstance(exc.value, ImportError)
 
-    def test_no_sdk_no_ollama_names_both_causes(self, no_sdk, with_key, monkeypatch):
+    def test_no_sdk_no_ollama_names_both_causes(
+        self, no_sdk, with_key, no_attested_keys, monkeypatch
+    ):
         """Nothing usable: every backend is skipped, so nothing is ever
         dispatched and `last_error` stays None.  The error used to read
         "All summary backends failed. Last error: None" — true, and useless.

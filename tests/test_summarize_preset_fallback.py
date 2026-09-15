@@ -41,7 +41,10 @@ from millet.summarize import (
 
 class TestBackendRegistry:
     def test_only_private_backends_remain(self):
-        assert set(BACKENDS) == {"tinfoil", "ollama"}
+        # Every backend is private: tinfoil/venice/near are attested TEEs,
+        # ollama is local.  No plaintext cloud backend may reappear.
+        assert set(BACKENDS) == {"tinfoil", "ollama", "venice", "near"}
+        assert not (set(BACKENDS) & set(RETIRED_BACKENDS))
 
     def test_retired_backends_rejected_when_explicit(self):
         """An explicit backend= is a caller bug and must fail loudly."""
@@ -124,11 +127,17 @@ class TestResolveFallbackOrder:
         monkeypatch.delenv("MILLET_SUMMARY_FALLBACK_ORDER", raising=False)
         order = _resolve_fallback_order()
         assert order == DEFAULT_FALLBACK_ORDER
-        assert order == ("tinfoil", "ollama")
+        assert order == ("tinfoil", "venice", "near", "ollama")
 
     def test_every_destination_is_private(self):
-        """The chain must not be able to downgrade confidentiality."""
-        assert all(b in ("tinfoil", "ollama") for b in DEFAULT_FALLBACK_ORDER)
+        """The chain must not be able to downgrade confidentiality.
+
+        tinfoil/venice/near are attested TEEs, ollama is local — all private.
+        """
+        assert all(
+            b in ("tinfoil", "venice", "near", "ollama")
+            for b in DEFAULT_FALLBACK_ORDER
+        )
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "ollama,tinfoil")
