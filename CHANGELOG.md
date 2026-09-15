@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.21.1 — hard wall-clock deadline on every Tinfoil attempt
+
+Incident 2026-09-15 (vezir/saray): a `confidential` summary pinned a job in
+`transcribing` for 30+ minutes with the GPU idle.  faulthandler stack:
+`openai → httpx → tinfoil custom transport → httpcore _receive_event →
+ssl.read` — blocked forever.  Two compounding causes:
+
+- The Tinfoil SDK's custom httpx transport does not reliably honour the
+  per-request `timeout` (passed since 0.13.0), so no per-phase timeout
+  bounds the call.
+- The openai SDK silently retries a timed-out request internally
+  (`max_retries=2` by default), so one millet "attempt" could legitimately
+  block for 600s × 3 = 30 minutes before millet's own retry ladder ever saw
+  an exception — and a transport-level stall never surfaced at all.
+
+Every `_summarize_tinfoil` attempt (client init + completion, primary and
+sibling model alike) now runs under an external wall-clock deadline of
+`config.timeout + 120s` (default 720s), enforced in a daemon thread.  A
+stalled attempt is abandoned (the thread dies with the process — a raw
+daemon thread, not a `ThreadPoolExecutor`, whose atexit join would hang
+interpreter exit on an abandoned worker) and raises `_TinfoilAttemptStuck`,
+a `TimeoutError` subclass, so the existing transient retry ladder applies
+unchanged.  After the budget the job fails loudly — or, on 0.21.0's chain,
+falls through to the decorrelated TEE providers.
+
+Verified live: a 42KB-prompt summary that repeatedly hung vezir's worker
+completed in 153.6s on the same code path, and a forced-stall test confirms
+all 3 attempts hit the wall-clock deadline and fail loud.
+
 ## v0.21.0 — attested TEE fallbacks (Venice, NEAR) so Tinfoil is not a SPOF
 
 Summarization had exactly one attested provider: Tinfoil.  If its enclave

@@ -135,6 +135,133 @@ def test_auth_error_fails_fast_no_retry(monkeypatch):
     assert state["attempt"] == 1  # no retry on a real auth error
 
 
+# ── hard wall-clock deadline (incident 2026-09-15) ──────────────────────────
+#
+# The SDK's custom httpx transport can block in ssl.read() with no effective
+# timeout: millet's per-request timeout=600 never fired and a summary attempt
+# pinned a vezir job in 'transcribing' for 30+ minutes.  Each attempt now runs
+# under an external wall-clock deadline; a stalled attempt raises
+# _TinfoilAttemptStuck (a TimeoutError subclass -> transient -> retried), and
+# the blocked daemon thread is abandoned to die with the process.
+
+
+def test_stuck_exception_is_transient_timeout():
+    assert _is_transient_network_error(sm._TinfoilAttemptStuck("stalled"))
+
+
+def test_deadline_helper_returns_result_and_propagates_errors():
+    assert sm._run_under_deadline(lambda: 42, seconds=5) == 42
+    with pytest.raises(ValueError, match="boom"):
+        sm._run_under_deadline(lambda: (_ for _ in ()).throw(ValueError("boom")), seconds=5)
+
+
+def test_deadline_helper_raises_stuck_on_expiry():
+    import threading
+
+    never = threading.Event()
+    with pytest.raises(sm._TinfoilAttemptStuck, match="wall-clock deadline"):
+        sm._run_under_deadline(lambda: never.wait(timeout=30), seconds=0.1)
+
+
+def test_stalled_attempt_aborts_and_retries_then_fails_loud(monkeypatch):
+    """A create() that never returns must not hang the pipeline: the
+    attempt aborts at its deadline, the ladder retries, and after the full
+    budget the job fails loudly instead of pinning 'transcribing' forever."""
+    import threading
+
+    calls = {"n": 0}
+    never = threading.Event()  # never set: create() blocks "forever"
+
+    class _Msg:
+        content = "## Meeting Overview"
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    class _Completions:
+        def create(self, **kwargs):
+            calls["n"] += 1
+            never.wait(timeout=30)  # abandoned thread gives up eventually
+            return _Resp()
+
+    class _Chat:
+        completions = _Completions()
+
+    class FakeTinfoilAI:
+        def __init__(self, api_key=None):
+            self.chat = _Chat()
+
+    import sys as _sys
+    import types as _types
+
+    mod = _types.ModuleType("tinfoil")
+    mod.TinfoilAI = FakeTinfoilAI
+    monkeypatch.setitem(_sys.modules, "tinfoil", mod)
+    monkeypatch.setattr(sm, "_resolve_tinfoil_api_key", lambda: "tk_fake")
+    import time as _t
+
+    monkeypatch.setattr(_t, "sleep", lambda *_a, **_k: None)
+    monkeypatch.setattr(sm, "_TINFOIL_ATTEMPT_GRACE_SECONDS", 0.1)
+
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-3-flash", timeout=0)
+    with pytest.raises(RuntimeError, match="unreachable after"):
+        sm._summarize_tinfoil("sys", "user", cfg)
+    # Every attempt hit the wall-clock deadline (never the per-request one).
+    assert calls["n"] == sm._TINFOIL_MAX_ATTEMPTS
+
+
+def test_stall_on_first_attempt_only_still_succeeds(monkeypatch):
+    """A one-off stall recovers: attempt 1 hits the deadline, attempt 2
+    answers normally — the summary is produced, no error surfaces."""
+    import threading
+
+    state = {"n": 0}
+
+    class _Msg:
+        content = "## Meeting Overview\n\nRecovered."
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    class _Completions:
+        def create(self, **kwargs):
+            state["n"] += 1
+            if state["n"] == 1:
+                threading.Event().wait(timeout=30)
+            return _Resp()
+
+    class _Chat:
+        completions = _Completions()
+
+    class FakeTinfoilAI:
+        def __init__(self, api_key=None):
+            self.chat = _Chat()
+
+    import sys as _sys
+    import types as _types
+
+    mod = _types.ModuleType("tinfoil")
+    mod.TinfoilAI = FakeTinfoilAI
+    monkeypatch.setitem(_sys.modules, "tinfoil", mod)
+    monkeypatch.setattr(sm, "_resolve_tinfoil_api_key", lambda: "tk_fake")
+    import time as _t
+
+    monkeypatch.setattr(_t, "sleep", lambda *_a, **_k: None)
+    monkeypatch.setattr(sm, "_TINFOIL_ATTEMPT_GRACE_SECONDS", 0.1)
+
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-3-flash", timeout=0)
+    result = sm._summarize_tinfoil("sys", "user", cfg)
+    assert state["n"] == 2
+    assert "Recovered" in result.markdown
+    assert result.backend == "tinfoil"
+
+
 # ── capacity (503) classification + sibling TEE fallback (v0.18.1) ───────────
 #
 # Tinfoil retired glm-5-2 with no notice: the model vanished from /v1/models

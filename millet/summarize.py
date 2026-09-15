@@ -1261,6 +1261,68 @@ _TINFOIL_BACKOFF_BASE = 2.0  # seconds: ~2s, 4s, 8s
 _TINFOIL_ATTEST_MAX_ATTEMPTS = 6
 _TINFOIL_ATTEST_BACKOFF = 1.5  # seconds, flat — the blip clears quickly
 
+# Headroom on top of ``config.timeout`` for one attempt's non-inference
+# work (router discovery, TLS, enclave attestation).  The hard deadline for
+# one attempt is ``config.timeout + _TINFOIL_ATTEMPT_GRACE_SECONDS``.
+_TINFOIL_ATTEMPT_GRACE_SECONDS = 120
+
+
+class _TinfoilAttemptStuck(TimeoutError):
+    """One Tinfoil attempt exceeded its wall-clock deadline.
+
+    Subclasses :class:`TimeoutError` so the transient-error classifier
+    treats it like any other timeout and the normal retry ladder applies.
+    """
+
+
+def _run_under_deadline(fn, *, seconds: float):
+    """Run ``fn()`` under a hard wall-clock deadline in a daemon thread.
+
+    Incident 2026-09-15: the Tinfoil SDK's custom httpx transport can block
+    in ``ssl.read()`` with no effective timeout — a summary attempt pinned a
+    vezir job in ``transcribing`` for 30+ minutes while millet's per-request
+    ``timeout=600`` never fired (faulthandler stack: openai -> httpx ->
+    tinfoil transport -> httpcore ``_receive_event`` -> ``ssl.read``).  The
+    transport drops the per-request deadline on the floor, so no per-phase
+    timeout can bound the call; only an external timer can.
+
+    When the deadline passes, the worker thread is *abandoned* (it cannot be
+    interrupted mid-``ssl.read``) and ``_TinfoilAttemptStuck`` is raised.
+    The thread is a daemon, so at most ``_TINFOIL_MAX_ATTEMPTS`` blocked
+    threads are leaked and they die with the process — millet runs as a
+    short-lived per-job subprocess.  (This is why a raw thread is used
+    instead of :class:`concurrent.futures.ThreadPoolExecutor`: the executor
+    joins its workers at interpreter exit via atexit, so an abandoned
+    blocked worker would hang process exit.)
+
+    Exceptions raised by ``fn`` itself propagate unchanged.
+    """
+    import queue
+    import threading
+
+    result: queue.Queue = queue.Queue(maxsize=1)
+
+    def _worker():
+        try:
+            result.put(("ok", fn()))
+        except BaseException as exc:
+            result.put(("err", exc))
+
+    threading.Thread(
+        target=_worker, name="tinfoil-attempt", daemon=True
+    ).start()
+    try:
+        kind, value = result.get(timeout=seconds)
+    except queue.Empty:
+        raise _TinfoilAttemptStuck(
+            f"attempt exceeded the hard wall-clock deadline of {seconds:.0f}s "
+            "(the Tinfoil transport stalled without honouring its "
+            "per-request timeout)"
+        ) from None
+    if kind == "err":
+        raise value
+    return value
+
 
 def _is_transient_network_error(exc: BaseException) -> bool:
     """True if ``exc`` looks like a transient connectivity/DNS blip worth
@@ -1446,28 +1508,30 @@ def _summarize_tinfoil(
         fail fast, and are unrelated to the model or the network, so they
         should not burn the attempts reserved for genuine transients.
         """
+        def _call():
+            # Client init does a network fetch (router discovery) — keep it
+            # inside the retry so a DNS blip here doesn't hard-fail.
+            client = TinfoilAI(api_key=api_key)
+            # timeout: passed per-request since 0.13.0 — but the SDK's custom
+            # transport does not reliably honour it (see _run_under_deadline),
+            # so the wall-clock deadline below is the actual guarantee.
+            return client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": _user_content(model)},
+                ],
+                temperature=config.temperature,
+                timeout=config.timeout,
+            )
+
         attempt = 0
         attest_failures = 0
         while True:
             attempt += 1
             try:
-                # Client init does a network fetch (router discovery) — keep it
-                # inside the retry so a DNS blip here doesn't hard-fail.
-                client = TinfoilAI(api_key=api_key)
-                # timeout: the only backend call that previously omitted it —
-                # a stalled TLS connection to the enclave hung the whole
-                # pipeline indefinitely, worst for the `confidential` preset
-                # which (by design) has no fallback. The Tinfoil SDK is
-                # OpenAI-compatible and honors per-request timeouts.
-                return client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": _user_content(model)},
-                    ],
-                    temperature=config.temperature,
-                    timeout=config.timeout,
-                )
+                deadline = config.timeout + _TINFOIL_ATTEMPT_GRACE_SECONDS
+                return _run_under_deadline(_call, seconds=deadline)
             except Exception as e:
                 if _is_attestation_error(e):
                     attest_failures += 1
@@ -1520,8 +1584,8 @@ def _summarize_tinfoil(
             if _is_transient_network_error(e):
                 raise RuntimeError(
                     "Tinfoil TEE unreachable after "
-                    f"{_TINFOIL_MAX_ATTEMPTS} attempts (transient network/DNS "
-                    f"reaching atc.tinfoil.sh): {e}"
+                    f"{_TINFOIL_MAX_ATTEMPTS} attempts (transient network/"
+                    f"timeout/capacity errors — last error: {e})"
                 ) from e
             raise RuntimeError(f"Tinfoil TEE API error: {e}") from e
 
