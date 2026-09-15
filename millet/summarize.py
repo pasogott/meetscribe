@@ -4,19 +4,32 @@ Every supported backend keeps meeting content private:
   - tinfoil: Hardware-attested TEE inference (requires TINFOIL_API_KEY).
              Prompts are encrypted into the enclave; neither the model
              provider nor the cloud operator can read them.  Default.
+  - venice / near: Decorrelated hardware-attested TEE fallbacks (Intel
+             TDX + NVIDIA H100/H200 Confidential Computing; millet verifies
+             each enclave's NRAS attestation + freshness nonce itself).
   - ollama:  Local Ollama server (free, fully local, never leaves the box).
 
 The non-private cloud backends (claudemax, openrouter, openai) were removed
 in 0.19.0.  A TEE model measurably out-summarized Sonnet 4.6 on grounded
-precision and recall across EN/DE/TR, so routing meeting content through a
-provider that can read it no longer bought anything -- see
+precision and recall across EN/DE/TR, so routing meeting content through
+a provider that can read it no longer bought anything -- see
 docs/tee-summarization-evaluation.md.
 
-Fallback chain: tinfoil -> ollama (see FALLBACK_ORDER).  Both destinations
-are private, so the chain cannot silently downgrade confidentiality.  An
-*explicitly requested* preset never falls back at all: it fails loud.
-Within the tinfoil backend, a drained enclave pool falls back once to a
-sibling TEE model (DEFAULT_TINFOIL_FALLBACK_MODEL) before giving up.
+Fallback chain: tinfoil -> venice -> near -> ollama (DEFAULT_FALLBACK_ORDER,
+overridable via MILLET_SUMMARY_FALLBACK_ORDER).  Every destination is
+private — three attested TEEs plus the local box — so the chain can never
+leak content to a third party; it can only trade quality, and it always
+says so (fallback_used + backend/model in the summary meta sidecar; a local
+fallback is recorded as ollama/<model>, never labelled a TEE).
+
+Since 0.21.2 an explicitly requested preset follows the same chain.  The
+preset names are pure aliases of the default (0.19.0), so pinning them to
+one provider converted recoverable outages into hard failures while
+protecting nothing: "confidential" means no third party can read the
+content, and every backend in the chain satisfies that — a local model as
+strictly as a TEE.  Within the tinfoil backend, a drained enclave pool
+falls back once to a sibling TEE model (DEFAULT_TINFOIL_FALLBACK_MODEL)
+before giving up.
 
 Configuration precedence (highest to lowest):
   1. Explicit keyword arguments / CLI flags (--summary-backend, --summary-model)
@@ -1913,21 +1926,27 @@ def summarize(
     """Generate a structured meeting summary from transcript text.
 
     Dispatches to the appropriate backend based on ``config.backend``.
-    If the configured backend is unavailable, automatically tries the
-    next backend in the fallback order (default: tinfoil -> ollama;
-    overridable via MILLET_SUMMARY_FALLBACK_ORDER).  Both are private,
-    so the chain cannot downgrade confidentiality.  An explicitly
-    requested preset never falls back -- it fails loud.
+    If the configured backend is unavailable or fails, automatically tries
+    the next backend in the fallback order (default:
+    tinfoil -> venice -> near -> ollama; overridable via
+    MILLET_SUMMARY_FALLBACK_ORDER).  Every backend in the chain is private —
+    three hardware-attested TEEs plus fully-local ollama — so the chain can
+    never downgrade confidentiality, only quality, and every fallback is
+    recorded (fallback_used + backend/model provenance, never silent).
+    Since 0.21.2 this applies to explicitly requested presets too: the
+    preset names are aliases of the default, so a "confidential" summary
+    produced by the local fallback is still confidential — it is marked
+    ollama/<model>, never labelled a TEE.
 
     Args:
         transcript_text: The plain-text transcript (as produced by
-            Transcript.to_text()).
+            ``Transcript.to_text()``).
         config: Summary configuration. Uses defaults if not provided.
         language: Language code of the transcript (e.g. "de", "fa").
             When provided (and not "en") the LLM is instructed to
             write the summary in that language.
-        progress_callback: Optional callable(str) for status messages
-            (e.g. reporting fallback attempts to the GUI/CLI).
+        progress_callback: Optional callable(str) -> None for status
+            messages (e.g. reporting fallback attempts to the GUI/CLI).
 
     Returns:
         MeetingSummary with the Markdown summary, model used, and timing.
@@ -1961,26 +1980,18 @@ def summarize(
     else:
         user_prompt = USER_PROMPT_TEMPLATE.format(transcript=transcript_text)
 
-    # An explicitly requested preset pins the backend: fail loud rather than
-    # quietly producing a summary from something the caller did not ask for.
-    # Since 0.19.0 every backend is private, so this is no longer a privacy
-    # guard -- it is a "you asked for X, you get X or an error" guard.  The
-    # MILLET_SUMMARY_PRESET_FALLBACK opt-in was removed with the cloud
-    # backends it existed to reach.
-    preset_fallback = False
+    # An explicit preset is a deprecated alias of the default (0.19.0):
+    # warn once, then let it ride the same fallback chain as everyone
+    # else.  Until 0.21.2 a requested preset re-raised the primary
+    # backend's failure instead — a guard from when presets selected
+    # backends with different privacy properties.  That axis is gone:
+    # every chain destination is private (attested TEEs + local), so the
+    # guard only converted recoverable provider outages into hard job
+    # failures.  "Confidential" remains guaranteed by construction — the
+    # chain has no third-party-readable destination — and any fallback is
+    # recorded, never silent.
     if config.preset and config.preset in SUMMARY_PRESETS:
         _warn_deprecated_preset(config.preset)
-        avail_config = SummaryConfig(
-            backend=config.backend,
-            ollama_url=config.ollama_url,
-        )
-        if not is_backend_available(avail_config):
-            msg = _backend_not_available_message(avail_config)
-            raise RuntimeError(
-                f"Summarization preset '{config.preset}' requires the "
-                f"'{config.backend}' backend, but it is unavailable: {msg}\n"
-                f"Set the required environment variable and try again."
-            )
 
     # Build the list of backends to try: configured first, then fallback order
     backends_to_try = [config.backend]
@@ -2051,18 +2062,6 @@ def summarize(
         except Exception as exc:
             last_error = exc
             _log(f"{backend} failed: {exc}")
-            # When a preset was explicitly selected, do NOT silently fall
-            # back to a different backend — the user chose a specific
-            # privacy/quality level.  Re-raise so the failure is visible,
-            # unless preset fallback was explicitly opted into (and the
-            # preset is not "confidential").
-            if (
-                config.preset
-                and config.preset in SUMMARY_PRESETS
-                and backend == config.backend
-                and not preset_fallback
-            ):
-                raise
             continue
 
     # All backends failed.  Distinguish "never reachable" from "tried and

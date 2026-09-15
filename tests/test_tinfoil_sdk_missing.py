@@ -103,21 +103,25 @@ class TestEndToEnd:
         assert result.backend == "ollama"
         assert result.fallback_used is True
 
-    def test_preset_fails_with_readable_message_not_importerror(
-        self, no_sdk, with_key, monkeypatch
+    def test_preset_chains_readably_when_sdk_missing(
+        self, no_sdk, with_key, no_attested_keys, monkeypatch
     ):
         """The worst old path: preset + key + no SDK raised ModuleNotFoundError
-        from deep inside the backend.  It must now fail at the guard."""
+        from deep inside the backend.  Since 0.20.1 the availability guard
+        skips tinfoil with a readable reason (no ImportError ever escapes),
+        and since 0.21.2 a preset job chains to the next private backend
+        instead of failing loud."""
         monkeypatch.setattr(sm, "is_ollama_available", lambda url: True)
-
-        def exploding_dispatch(*a, **kw):  # pragma: no cover - must never run
-            raise AssertionError("dispatch reached despite unavailable backend")
-
-        monkeypatch.setattr(sm, "_dispatch", exploding_dispatch)
-        with pytest.raises(RuntimeError) as exc:
-            summarize("transcript text", SummaryConfig(preset="confidential"))
-        assert "not installed" in str(exc.value)
-        assert not isinstance(exc.value, ImportError)
+        monkeypatch.setattr(
+            sm, "_dispatch",
+            lambda backend, s, u, cfg, **kw: MeetingSummary(
+                markdown="# Summary\n\nLong enough to be a real body.",
+                model="ollama-model", elapsed_seconds=1.0, backend=backend,
+            ),
+        )
+        result = summarize("transcript text", SummaryConfig(preset="confidential"))
+        assert result.backend == "ollama"
+        assert result.fallback_used is True
 
     def test_no_sdk_no_ollama_names_both_causes(
         self, no_sdk, with_key, no_attested_keys, monkeypatch

@@ -581,9 +581,14 @@ Two narrower safety nets sit inside that:
   (HTTP 503) or retired (404), millet retries once on a different TEE model
   family before giving up.  Still attested; never silent (`fallback_used` is
   recorded in the `.meta.json` sidecar).
-- **Explicit preset pins the backend.**  When `--summary-preset` is given,
-  fallback is disabled for that run: it either succeeds on the requested
-  backend or fails loudly with a non-zero exit.
+- **Requested presets ride the same chain** (since 0.21.2).  Every
+  destination is private — attested TEEs plus fully-local Ollama — so a
+  `confidential` summary produced anywhere in the chain is still
+  confidential: content never reaches a third party.  A local fallback is
+  recorded as `ollama/<model>` provenance, never labelled a TEE, and every
+  switch is marked in the `.meta.json` sidecar.  (Until 0.21.2 a requested
+  preset failed loud instead of falling back — a guard from the era when
+  presets selected between backends of different privacy.)
 
 ### Summarization presets (deprecated)
 

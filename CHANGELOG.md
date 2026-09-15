@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.21.2 — requested presets ride the private fallback chain
+
+Until now an explicitly requested preset (`--summary-preset confidential`,
+which vezir sends on every upload) re-raised the primary backend's failure
+instead of falling back: no venice, no near, no ollama — a hard job error
+on any full Tinfoil outage.  That guard predates the private-only era: it
+existed to prevent a requested preset from silently routing meeting content
+to a cloud backend that could read it.  Since 0.19.0 every backend is
+private — three hardware-attested TEEs plus fully-local Ollama — so the
+guard protected nothing while converting recoverable provider outages into
+hard failures on the one path production always sends.
+
+The confidential contract is "no third party can read the content".  Every
+destination in the chain satisfies it — a local model as strictly as a TEE
+(content never leaves the box).  A requested preset therefore follows the
+same chain as the default (`tinfoil → venice → near → ollama`, order
+unchanged): a Tinfoil outage degrades quality, never confidentiality, and
+never silently — every switch records `fallback_used` and `<backend>/<model>`
+provenance in `.summary.meta.json` (vezir surfaces it as `jobs.summary_fallback`
++ `· fallback`, and a local fallback is `ollama/<model>`, never labelled a
+TEE).  The preset-unavailable pre-flight raise is gone too: a missing
+primary key now chains (with the skip reason kept for the all-unavailable
+error) instead of hard-failing.
+
+- `summarize()` module/function docstrings updated to the chain semantics;
+  README's "explicit preset pins the backend" section rewritten.
+- Tests: `TestPresetFallback` replaces `TestPresetNeverFallsBack` — preset
+  chains across the tier (TEE tier preferred when available, local marked
+  never-TEE, unavailable primary chains, all-failing still fails loud);
+  the tinfoil-SDK-missing end-to-end test now pins the chained path.
+  Suite 410 → 418.
+
 ## v0.21.1 — hard wall-clock deadline on every Tinfoil attempt
 
 Incident 2026-09-15 (vezir/saray): a `confidential` summary pinned a job in

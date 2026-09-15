@@ -2,14 +2,23 @@
 
 0.19.0 removed the non-private cloud backends (claudemax, openrouter,
 openai).  What used to be a privacy/quality tradeoff across five backends is
-now two private ones -- a hardware-attested TEE and local Ollama -- so:
+now private ones only -- three hardware-attested TEEs and local Ollama --
+so:
 
   - the preset axis is retired; the three historical names are kept as
     aliases for the default so existing callers (vezir passes
     --summary-preset on every job) and ~580 stored jobs keep working;
   - MILLET_SUMMARY_PRESET_FALLBACK is gone, because the cloud backends it
-    existed to reach are gone.  An explicitly requested preset now always
-    fails loud rather than silently producing something else;
+    existed to reach are gone;
+  - since 0.21.2 an explicitly requested preset rides the same fallback
+    chain as the default.  The old fail-loud pin predates the private-only
+    era (it guarded against silently routing content to a cloud backend
+    that could read it); with every chain destination private, the pin only
+    converted recoverable provider outages into hard job failures.
+    "Confidential" is preserved by construction -- no destination in the
+    chain leaks to a third party -- and every fallback is recorded
+    (fallback_used + backend/model provenance; a local fallback is
+    ollama/<model>, never labelled a TEE);
   - stale environment config naming a removed backend must degrade with a
     warning, not crash every job on a deployment that upgrades.
 """
@@ -175,7 +184,7 @@ class TestPresetAliasing:
         assert caplog.text.count("is deprecated") == 1
 
 
-# ─── Preset never falls back ───────────────────────────────────────────────
+# ─── Requested presets ride the fallback chain (0.21.2) ─────────────────────
 
 
 def _fake_summary(backend: str) -> MeetingSummary:
@@ -199,19 +208,59 @@ def _patch_backends(monkeypatch, available: set[str], failing: set[str]):
     monkeypatch.setattr(sm, "_dispatch", fake_dispatch)
 
 
-class TestPresetNeverFallsBack:
-    @pytest.mark.parametrize("preset", ["high-quality", "confidential", "alternative"])
-    def test_requested_preset_fails_loud(self, monkeypatch, preset):
-        """No preset falls back, and the opt-in env var is gone -- setting it
-        must not resurrect the behaviour."""
-        monkeypatch.setenv("MILLET_SUMMARY_PRESET_FALLBACK", "1")
-        _patch_backends(monkeypatch, available={"tinfoil", "ollama"}, failing={"tinfoil"})
-        with pytest.raises(RuntimeError, match="quota exhausted"):
-            summarize("transcript text", SummaryConfig(preset=preset))
+class TestPresetFallback:
+    """Since 0.21.2 a requested preset follows the same chain as the
+    default.  Confidentiality is guaranteed by construction (every
+    destination is private); quality may degrade, and the fallback is
+    always recorded — never silent, never mislabelled."""
 
-    def test_unavailable_primary_raises_with_actionable_message(self, monkeypatch):
+    @pytest.mark.parametrize("preset", ["high-quality", "confidential", "alternative"])
+    def test_requested_preset_falls_back_across_chain(self, monkeypatch, preset):
+        """Primary TEE failing must not kill a preset job: the chain walks
+        to the next private backend and the switch is recorded."""
+        _patch_backends(
+            monkeypatch,
+            available={"tinfoil", "ollama"},  # venice/near skipped: no key
+            failing={"tinfoil"},
+        )
+        result = summarize("transcript text", SummaryConfig(preset=preset))
+        assert result.backend == "ollama"
+        assert result.fallback_used is True
+        assert result.preset == preset  # the ask is preserved in provenance
+
+    def test_requested_preset_falls_back_to_attested_tier(self, monkeypatch):
+        """A decorrelated TEE is preferred over local when available —
+        quality-first ordering, privacy identical."""
+        _patch_backends(
+            monkeypatch,
+            available={"tinfoil", "venice"},
+            failing={"tinfoil"},
+        )
+        result = summarize("transcript text", SummaryConfig(preset="confidential"))
+        assert result.backend == "venice"
+        assert result.fallback_used is True
+
+    def test_local_fallback_provenance_is_never_labelled_tee(self, monkeypatch):
         _patch_backends(monkeypatch, available={"ollama"}, failing=set())
-        with pytest.raises(RuntimeError, match="requires the 'tinfoil' backend"):
+        result = summarize("transcript text", SummaryConfig(preset="confidential"))
+        assert result.backend == "ollama"
+        assert "TEE" not in result.model  # local is local, never attested
+        assert result.fallback_used is True
+
+    def test_unavailable_primary_chains_instead_of_raising(self, monkeypatch):
+        """No tinfoil key at all: the chain skips it (with the reason kept
+        for the all-skipped error) rather than hard-failing the preset."""
+        _patch_backends(monkeypatch, available={"venice"}, failing=set())
+        result = summarize("transcript text", SummaryConfig(preset="confidential"))
+        assert result.backend == "venice"
+
+    def test_all_private_backends_failing_still_fails_loud(self, monkeypatch):
+        _patch_backends(
+            monkeypatch,
+            available={"tinfoil", "ollama"},
+            failing={"tinfoil", "ollama"},
+        )
+        with pytest.raises(RuntimeError, match="All summary backends failed"):
             summarize("transcript text", SummaryConfig(preset="confidential"))
 
     def test_primary_success_tags_result(self, monkeypatch):
