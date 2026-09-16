@@ -89,6 +89,21 @@ class TestUsableFrames:
         frames = [_png(tmp_path / f"cue_{i:04d}.png") for i in range(MAX_FRAMES + 10)]
         assert len(_usable_frames(frames)) == MAX_FRAMES
 
+    def test_over_cap_samples_evenly_not_head(self, tmp_path):
+        """18 cue frames on a ~4-minute recording (session
+        01M2P6FTRG4WAKKE5T7TV6HNFM) exceeded the endpoint's 10-image cap.
+        The sample must span the whole timeline: first + last kept, not a
+        head-truncation that summarizes only the opening minutes."""
+        frames = [_png(tmp_path / f"cue_{i:04d}.png") for i in range(18)]
+        picked = _usable_frames(frames)
+        assert len(picked) == MAX_FRAMES
+        assert picked[0] == frames[0]
+        assert picked[-1] == frames[-1]
+        assert len(set(picked)) == MAX_FRAMES  # no duplicates from rounding
+        # Order preserved: picked indices are strictly increasing in `frames`.
+        idx = [frames.index(p) for p in picked]
+        assert idx == sorted(idx)
+
     def test_config_normalizes_frames(self, tmp_path):
         good = _png(tmp_path / "cue_00-00-01.png")
         cfg = SummaryConfig(backend="tinfoil", frames=[good, tmp_path / "missing.png"])
@@ -208,6 +223,21 @@ class TestTinfoilMessageShape:
         sm._summarize_tinfoil("sys", "user text", cfg)
         img = [p for p in _user_content(calls[0]) if p["type"] == "image_url"][0]
         assert img["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+    def test_over_cap_frames_send_at_most_ten_images(self, monkeypatch, tmp_path):
+        """Regression (verified live 2026-09-17): the attested vision
+        endpoints reject a request carrying more than 10 images — venice
+        answered 400 "At most 10 image(s) may be provided in one request"
+        and the job failed on every vision backend.  The request must
+        carry at most MAX_FRAMES image parts no matter how many cue
+        frames the session produced."""
+        calls = _fake_tinfoil(monkeypatch)
+        frames = [_png(tmp_path / f"cue_{i:04d}.png") for i in range(MAX_FRAMES + 8)]
+        cfg = SummaryConfig(backend="tinfoil", model="glm-5-3-flash", frames=frames)
+        result = sm._summarize_tinfoil("sys", "user text", cfg)
+        images = [p for p in _user_content(calls[0]) if p["type"] == "image_url"]
+        assert len(images) == MAX_FRAMES
+        assert result.frames_used == MAX_FRAMES
 
 
 class TestSiblingFallbackDropsFrames:

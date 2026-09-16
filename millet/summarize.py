@@ -274,10 +274,16 @@ def verify_model(backend: str, model: str, *, timeout: int = 10) -> str | None:
 # frames run into a hard failure on the sibling fallback.
 VISION_MODELS = ("glm-5-3-flash", "qwen3-vl", "e2ee-qwen3-vl")
 
-# Per-frame cost is roughly 2.2k tokens at 880x1920, linear in frame count.
-# The cap bounds a pathological session rather than trimming a normal one
-# (vezir already samples down to 45 frames before we ever see them).
-MAX_FRAMES = 45
+# Hard endpoint limit, not a budget choice: the attested vision endpoints
+# reject a request carrying more than 10 images outright — verified live
+# 2026-09-17 (session 01M2P6FTRG4WAKKE5T7TV6HNFM, 18 cue frames → venice
+# 400 "At most 10 image(s) may be provided in one request").  The job log
+# only carries the chain's last error, so tinfoil's own failure text went
+# uncaptured — the cap is applied to every vision backend so whichever one
+# serves the request is safe.  Over-cap frames are even-sampled (first +
+# last kept) so coverage still spans the whole recording; the full frame
+# set remains on disk as synced artifacts.
+MAX_FRAMES = 10
 _FRAME_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 _MAX_FRAME_BYTES = 8 * 1024 * 1024
 
@@ -300,8 +306,12 @@ def _usable_frames(frames: list[Path]) -> list[Path]:
             continue
         out.append(p)
     if len(out) > MAX_FRAMES:
-        logger.info("frames: %d supplied, using the first %d", len(out), MAX_FRAMES)
-        out = out[:MAX_FRAMES]
+        logger.info(
+            "frames: %d supplied, evenly sampling %d (endpoint image cap)",
+            len(out), MAX_FRAMES,
+        )
+        step = (len(out) - 1) / (MAX_FRAMES - 1)
+        out = [out[round(i * step)] for i in range(MAX_FRAMES)]
     return out
 
 

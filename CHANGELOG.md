@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.21.3 — cap summary frames at the endpoint's 10-image request limit
+
+Incident 2026-09-17 (vezir/saray): the first screen recording long enough
+to narrate more than ten cues failed its summary on every backend.  Session
+`01M2P6FTRG4WAKKE5T7TV6HNFM` (18 cue frames, `iteration-plan` template)
+hit venice answering 400 `At most 10 image(s) may be provided in one
+request` — a request-shape validation, not a transient fault, so retry
+budgets burned and the vision gate (correctly) refused to drop the frames
+onto a text-only tier.  `millet label --apply-json` exited 1 and vezir
+recorded `summary_error`.
+
+`MAX_FRAMES` was 45, chosen for token budget and attachment-sync headroom
+on the assumption that vezir's extraction cap was the binding constraint;
+nobody had checked what the vision endpoints actually accept per request.
+Both attested vision paths (tinfoil's `_user_content`, the shared
+`_encode_frames_content` for venice/near) attach every normalized frame to
+a single message, so any session with >10 cues was guaranteed to fail —
+short demos only ever worked because they were short.
+
+- `MAX_FRAMES` 45 → 10: now the endpoint's hard limit, documented where it
+  is enforced (verified live 2026-09-17), not a budget heuristic.
+- `_usable_frames` over-cap selection changed from head-truncation
+  (`out[:MAX_FRAMES]`, which would summarize only the opening minutes) to
+  even sampling across the timeline — first + last frames kept, mirroring
+  vezir's `_even_sample`.  Frames on disk are untouched: they remain full
+  artifacts for the TUI/Android/git sync; only the model request is
+  sampled.  A 10-frame request is also ~4.5x cheaper (~22k vs ~100k
+  frame-tokens).
+- Tests: even sampling keeps first + last and never duplicates through
+  index rounding; a regression test pins the production failure shape —
+  `MAX_FRAMES + 8` frames in, exactly `MAX_FRAMES` image parts on the
+  wire and `frames_used == MAX_FRAMES`.  Suite 418 → 420.
+
 ## v0.21.2 — requested presets ride the private fallback chain
 
 Until now an explicitly requested preset (`--summary-preset confidential`,
