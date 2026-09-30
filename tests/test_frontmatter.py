@@ -122,6 +122,15 @@ class TestBuildFrontmatter:
         assert fm["type"] == "meeting"
         assert fm["source"] == {"session_id": None, "audio_sha256": None}
 
+    def test_crosstalk_is_never_a_participant(self):
+        ctx = FrontmatterContext(
+            transcript_speakers=["Kemal", "CROSSTALK"],
+            speaker_channels={"CROSSTALK": "system"},
+        )
+        fm = build_frontmatter({"participants": ["crosstalk", "Lukas"]}, ctx)
+        validate_frontmatter(fm)
+        assert [p["name"] for p in fm["participants"]] == ["Kemal", "Lukas"]
+
     def test_with_extracted_data(self):
         ctx = FrontmatterContext(
             title="Pricing",

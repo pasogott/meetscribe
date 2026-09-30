@@ -50,6 +50,7 @@ _NOTO_ARABIC_BOLD = "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf"
 
 _fonts_registered = False
 
+from millet.crosstalk import is_reserved_label
 from millet.languages import PDF_SECTIONS as _PDF_SECTIONS
 from millet.languages import RTL_LANGUAGES as _RTL_LANGUAGES
 
@@ -581,9 +582,14 @@ def generate_pdf(
     if transcript.duration and transcript.duration > 0:
         meta_parts.append(f"Duration: {_fmt_duration(transcript.duration)}")
 
-    if transcript.speakers:
-        speaker_names = ", ".join(s.label or s.id for s in transcript.speakers)
-        meta_parts.append(f"Participants: {speaker_names}")
+    # CROSSTALK (unattributable fillers) is not a participant; its lines still
+    # appear in the transcript section under that label.
+    people = [
+        s.label or s.id for s in transcript.speakers
+        if not is_reserved_label(s.label or s.id)
+    ]
+    if people:
+        meta_parts.append(f"Participants: {', '.join(people)}")
 
     meta_parts.append("Recording source: AI transcription (millet)")
 

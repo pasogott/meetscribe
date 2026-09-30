@@ -21,6 +21,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from millet.crosstalk import is_reserved_label
+
 log = logging.getLogger(__name__)
 
 
@@ -525,7 +527,11 @@ def enroll_session(
 
     # Transcript segments already have real names as speaker IDs (post-relabel)
     # Build a pseudo speaker_labels where key == value (name -> name)
-    name_to_name = {name: name for name in speaker_labels.values()}
+    # Reserved non-person labels (CROSSTALK) are never enrolled.
+    name_to_name = {
+        name: name for name in speaker_labels.values()
+        if not is_reserved_label(name)
+    }
 
     # Find audio file
     audio_path = files.get("wav")
@@ -610,6 +616,9 @@ def identify_speakers(
         Speakers without a confident match are omitted.
     """
     profiles = load_profiles(profiles_path=profiles_path)
+    # A reserved label must never be matched, even if an older build or a
+    # hand-edited DB enrolled one.
+    profiles = {n: p for n, p in profiles.items() if not is_reserved_label(n)}
     if not profiles:
         return {}
 
@@ -788,6 +797,12 @@ def update_profiles_from_confirmed_labels(
         profiles_path: Explicit path to the profile DB.  When ``None``,
             falls back to :func:`_default_profiles_path`.
     """
+    # Reserved non-person labels (CROSSTALK) are mixed audio from several
+    # people — a profile built from them would later "match" real speakers.
+    confirmed_label_map = {
+        sid: name for sid, name in confirmed_label_map.items()
+        if not is_reserved_label(name)
+    }
     if not confirmed_label_map:
         return
 

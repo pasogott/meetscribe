@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 import numpy as np
 
+from millet.crosstalk import CROSSTALK
 from millet.label import (
-    REMOTE_ABSORB_MAX_SEGMENTS,
     TINY_SPEAKER_MAX_SECONDS,
     TINY_SPEAKER_MAX_SEGMENTS,
     SpeakerInfo,
@@ -17,8 +17,8 @@ from millet.label import (
     _find_session_files,
     _load_transcript,
     absorb_tiny_speakers,
-    absorb_unresolved_remote,
     apply_labels,
+    crosstalk_label_map,
     extract_speaker_clip,
     get_speakers,
     relabel_transcript_in_memory,
@@ -572,6 +572,66 @@ class TestApplyLabelsSummaryLanguage:
         assert not list(session_dir.glob(f"{basename}.summary.??.md"))
 
 
+class TestApplyLabelsCrosstalk:
+    """CROSSTALK lines stay in the transcript but never reach the summary
+    model or the participant list."""
+
+    def _fake_summary(self):
+        from millet.summarize import MeetingSummary
+        return MeetingSummary(
+            markdown="## Overview\nFine.", backend="test", model="m",
+            elapsed_seconds=0.1, data={"participants": ["CROSSTALK", "Kemal"]},
+            data_error=None,
+        )
+
+    def _session(self, tmp_path):
+        sdir = tmp_path / "s1"
+        sdir.mkdir()
+        _raw_txn([
+            Segment(start=0.0, end=30.0, text="real content", speaker="SPEAKER_00"),
+            Segment(start=31.0, end=31.2, text="Bye.", speaker="REMOTE"),
+        ]).save(sdir, basename="s1")
+        return sdir
+
+    def test_summary_input_excludes_crosstalk(self, tmp_path):
+        sdir = self._session(tmp_path)
+        with patch("millet.summarize.is_backend_available", return_value=True), \
+             patch("millet.summarize.summarize", return_value=self._fake_summary()) as summ, \
+             patch("millet.transcribe.ensure_gpu_available", lambda *a, **k: None):
+            apply_labels(
+                sdir, {"SPEAKER_00": "Kemal", "REMOTE": CROSSTALK},
+                regenerate_summary=True,
+            )
+        text = summ.call_args.args[0]
+        assert "Kemal: real content" in text
+        assert CROSSTALK not in text and "Bye." not in text
+        # The transcript itself keeps the line, honestly labeled.
+        assert f"{CROSSTALK}: Bye." in (sdir / "s1.txt").read_text()
+        # LLM-listed "CROSSTALK" is not a participant.
+        fm = json.loads((sdir / "s1.frontmatter.json").read_text())
+        assert [p["name"] for p in fm["participants"]] == ["Kemal"]
+
+    def test_find_and_replace_path_drops_crosstalk_participant(self, tmp_path):
+        # vezir's `label --auto --no-summary` path: the transcribe-time
+        # summary listed REMOTE; renaming it must not create a participant.
+        from millet.frontmatter import render_frontmatter_block
+
+        sdir = self._session(tmp_path)
+        fm = {"schema_version": 1, "type": "meeting", "participants": [
+            {"name": "SPEAKER_00", "role": None, "channel": None},
+            {"name": "REMOTE", "role": None, "channel": "system"},
+        ]}
+        (sdir / "s1.summary.md").write_text(
+            render_frontmatter_block(fm) + "## Overview\nREMOTE said bye.\n",
+        )
+        apply_labels(
+            sdir, {"SPEAKER_00": "Kemal", "REMOTE": CROSSTALK},
+            regenerate_summary=False,
+        )
+        side = json.loads((sdir / "s1.frontmatter.json").read_text())
+        assert [p["name"] for p in side["participants"]] == ["Kemal"]
+
+
 class TestApplyLabelsSummaryTemplate:
     """summary_template writes <name>.<template>.md instead of clobbering
     the primary <name>.summary.md."""
@@ -696,101 +756,154 @@ class TestRelabelSpeakerDedup:
         assert [s.id for s in out.speakers] == ["Kasita", "Ahmad"]
 
 
-# ─── absorb_unresolved_remote: rescue the leftover REMOTE bucket (A1, 0.12.12) ─
-# The dual-diarize path leaves a small literal REMOTE bucket (unassigned system
-# segments + non-overlapping mic bleed) AFTER consolidation, so it never merges
-# and rarely voiceprint-matches.  This forces needs_labeling even when every
-# real participant was identified.  absorb_unresolved_remote folds a SMALL such
-# leftover onto the named speaker it overlaps most in time.
+# ─── crosstalk_label_map: ghost REMOTE bucket → CROSSTALK ────────────────────
+# The dual-diarize path leaves a literal REMOTE bucket of sub-second fillers
+# ("Bye.", "Yeah.") from several people that no voiceprint matches.  It is
+# labeled CROSSTALK (unattributable) instead of forcing needs_labeling.
+# Transcripts here use RAW ids, exactly as `label --auto` sees them in
+# production — the 0.12.12 rescue was only ever tested on pre-named segments,
+# which is how its names-vs-raw-ids bug stayed invisible.
 
-class TestAbsorbUnresolvedRemote:
-    def _txn(self, segments):
-        speakers = []
-        seen = set()
-        for s in segments:
-            if s.speaker and s.speaker not in seen:
-                seen.add(s.speaker)
-                speakers.append(Speaker(id=s.speaker, label=s.speaker))
-        return Transcript(
-            segments=segments, speakers=speakers, language="en",
-            audio_file="x.ogg", duration=100.0,
-        )
+# ~3000 words of meeting, so share gates are measured against a real meeting.
+_MAIN_TEXT = "we talked about the release plan and the migration " * 300
 
-    def test_small_remote_absorbed_into_overlapping_named(self):
-        # REMOTE one-liners interleaved with Openoms' speech → absorbed to Openoms.
+
+def _raw_txn(segments, duration=4000.0):
+    speakers = []
+    seen = set()
+    for s in segments:
+        if s.speaker and s.speaker not in seen:
+            seen.add(s.speaker)
+            speakers.append(Speaker(id=s.speaker, label=s.speaker))
+    return Transcript(
+        segments=segments, speakers=speakers, language="en",
+        audio_file="x.ogg", duration=duration,
+    )
+
+
+def _devstandup_segments():
+    """Shape of session 01M3RS442M3XX4D2AGK80641A7: named-able raw clusters
+    carrying the meeting, plus a 10-segment / 3.2 s REMOTE of fillers, one of
+    which is a line leaking from another speaker."""
+    segs = []
+    t = 0.0
+    for i in range(60):  # ~20 min of real speech across two raw clusters
+        spk = "SPEAKER_00" if i % 2 else "SPEAKER_01"
+        segs.append(Segment(start=t, end=t + 20.0, text="real content " * 20, speaker=spk))
+        t += 25.0
+    fillers = [
+        (393.2, 394.5, "Yeah, I think that's the bulk of that."),
+        (498.2, 498.5, "Hmm."), (1353.7, 1353.9, "Bye."), (2113.7, 2113.8, "Bye."),
+        (2715.8, 2716.0, "Bye."), (2825.4, 2825.6, "Yeah."), (2912.1, 2912.3, "Yeah."),
+        (3323.2, 3323.5, "Right."), (3676.4, 3676.5, "Wow."), (3957.2, 3957.4, "What?"),
+    ]
+    segs += [Segment(start=s, end=e, text=x, speaker="REMOTE") for s, e, x in fillers]
+    return sorted(segs, key=lambda s: s.start)
+
+
+class TestCrosstalkLabelMap:
+    def test_real_session_shape_becomes_crosstalk(self):
+        txn = _raw_txn(_devstandup_segments())
+        # Raw ids resolved by voiceprint are the label-map KEYS.
+        assert crosstalk_label_map(txn, {"SPEAKER_00", "SPEAKER_01"}) == {
+            "REMOTE": CROSSTALK,
+        }
+
+    def test_needs_no_named_speaker(self):
+        # Unlike the old rescue, CROSSTALK needs no absorb target.
+        txn = _raw_txn(_devstandup_segments())
+        assert crosstalk_label_map(txn, set()) == {"REMOTE": CROSSTALK}
+
+    def test_many_fillers_in_long_meeting_still_crosstalk(self):
+        # 44 fillers / ~22 s in a ~3 h call (session 01M0NQT1): over the old
+        # fixed 25-segment cap, but still < 1% of the meeting.
         segs = [
-            Segment(start=0.0, end=10.0, text="long openoms turn", speaker="Openoms"),
-            Segment(start=10.2, end=10.6, text="yeah", speaker="REMOTE"),
-            Segment(start=11.0, end=20.0, text="more openoms", speaker="Openoms"),
-            Segment(start=20.1, end=20.5, text="ok", speaker="REMOTE"),
-            Segment(start=30.0, end=40.0, text="hoang turn", speaker="Hoang"),
+            Segment(start=i * 60.0, end=i * 60.0 + 55.0, text="talk " * 100,
+                    speaker="SPEAKER_00")
+            for i in range(170)
         ]
-        txn = self._txn(segs)
-        absorb = absorb_unresolved_remote(txn, {"Openoms", "Hoang"})
-        assert absorb == {"REMOTE": "Openoms"}
-
-    def test_remote_absorbed_into_nearest_when_no_overlap(self):
-        # REMOTE one-liner between turns, no direct overlap → nearest named wins.
-        segs = [
-            Segment(start=0.0, end=10.0, text="openoms", speaker="Openoms"),
-            Segment(start=50.0, end=50.4, text="yeah", speaker="REMOTE"),  # nearer Hoang
-            Segment(start=51.0, end=60.0, text="hoang", speaker="Hoang"),
+        segs += [
+            Segment(start=i * 230.0 + 56.0, end=i * 230.0 + 56.5, text="yeah",
+                    speaker="REMOTE")
+            for i in range(44)
         ]
-        txn = self._txn(segs)
-        absorb = absorb_unresolved_remote(txn, {"Openoms", "Hoang"})
-        assert absorb == {"REMOTE": "Hoang"}
+        assert crosstalk_label_map(_raw_txn(segs), set()) == {"REMOTE": CROSSTALK}
 
-    def test_large_remote_not_absorbed(self):
-        # A substantial unknown (> max seconds) stays raw for human review.
-        segs = [Segment(start=0.0, end=5.0, text="openoms", speaker="Openoms")]
-        # 40s of REMOTE speech across many segments → over the 30s cap.
-        for i in range(20):
-            segs.append(Segment(start=100.0 + i * 3, end=100.0 + i * 3 + 2.0,
-                                text="unknown person talking", speaker="REMOTE"))
-        txn = self._txn(segs)
-        absorb = absorb_unresolved_remote(txn, {"Openoms"})
-        assert absorb == {}
+    def test_substantial_remote_stays_raw(self):
+        # A real unidentified remote participant (full sentences) → human.
+        segs = [Segment(start=0.0, end=600.0, text=_MAIN_TEXT, speaker="SPEAKER_00")]
+        segs += [
+            Segment(start=600.0 + i * 10, end=600.0 + i * 10 + 0.9,
+                    text="an actual sentence with real content in it", speaker="REMOTE")
+            for i in range(5)
+        ]
+        assert crosstalk_label_map(_raw_txn(segs), set()) == {}
 
-    def test_too_many_remote_segments_not_absorbed(self):
-        segs = [Segment(start=0.0, end=5.0, text="openoms", speaker="Openoms")]
-        # Many tiny segments (> max count) but little total time.
-        for i in range(REMOTE_ABSORB_MAX_SEGMENTS + 5):
-            segs.append(Segment(start=100.0 + i, end=100.0 + i + 0.2,
-                                text="x", speaker="REMOTE"))
-        txn = self._txn(segs)
-        absorb = absorb_unresolved_remote(txn, {"Openoms"})
-        assert absorb == {}
+    def test_share_gate(self):
+        # Short fillers, but a big share of a short meeting's words.
+        segs = [Segment(start=0.0, end=20.0, text=_MAIN_TEXT[:60], speaker="SPEAKER_00")]
+        segs += [
+            Segment(start=30.0 + i, end=30.0 + i + 0.8, text="yeah", speaker="REMOTE")
+            for i in range(10)
+        ]
+        assert crosstalk_label_map(_raw_txn(segs), set()) == {}
 
-    def test_no_named_speakers_no_absorb(self):
-        segs = [Segment(start=0.0, end=2.0, text="yeah", speaker="REMOTE")]
-        txn = self._txn(segs)
-        assert absorb_unresolved_remote(txn, set()) == {}
+    def test_stretched_filler_timestamps_do_not_count_as_speech(self):
+        # Whisper stretches fillers ("No, no, no." over 22.6 s); a ghost is
+        # judged by what was said, not by inflated durations.
+        segs = [Segment(start=0.0, end=3000.0, text=_MAIN_TEXT, speaker="SPEAKER_00")]
+        segs += [
+            Segment(start=3000.0 + i, end=3000.0 + i + 0.3, text="yeah", speaker="REMOTE")
+            for i in range(10)
+        ]
+        segs += [
+            Segment(start=3100.0, end=3122.6, text="No, no, no.", speaker="REMOTE"),
+            Segment(start=3130.0, end=3139.5, text="Mm-mm.", speaker="REMOTE"),
+        ]
+        assert crosstalk_label_map(_raw_txn(segs), set()) == {"REMOTE": CROSSTALK}
+
+    def test_more_than_two_substantive_lines_stays_raw(self):
+        segs = [Segment(start=0.0, end=3000.0, text=_MAIN_TEXT, speaker="SPEAKER_00")]
+        segs += [
+            Segment(start=3000.0 + i, end=3000.0 + i + 0.3, text="yeah", speaker="REMOTE")
+            for i in range(10)
+        ]
+        segs += [
+            Segment(start=3100.0 + i * 5, end=3100.0 + i * 5 + 3.0,
+                    text="a full sentence someone actually said here", speaker="REMOTE")
+            for i in range(3)
+        ]
+        assert crosstalk_label_map(_raw_txn(segs), set()) == {}
+
+    def test_speaker_n_is_never_crosstalk(self):
+        # A raw SPEAKER_n is a real pyannote cluster; tiny ones fold instead.
+        segs = [Segment(start=0.0, end=3000.0, text=_MAIN_TEXT, speaker="SPEAKER_00")]
+        segs += [
+            Segment(start=3000.0 + i, end=3000.0 + i + 0.3, text="yeah", speaker="SPEAKER_07")
+            for i in range(5)
+        ]
+        assert crosstalk_label_map(_raw_txn(segs), set()) == {}
+
+    def test_several_ghost_buckets_collapse(self):
+        segs = [Segment(start=0.0, end=3000.0, text=_MAIN_TEXT, speaker="SPEAKER_00")]
+        for rid in ("REMOTE", "REMOTE_1"):
+            segs += [
+                Segment(start=3000.0 + i, end=3000.0 + i + 0.3, text="yeah", speaker=rid)
+                for i in range(4)
+            ]
+        assert crosstalk_label_map(_raw_txn(segs), set()) == {
+            "REMOTE": CROSSTALK, "REMOTE_1": CROSSTALK,
+        }
 
     def test_resolved_remote_not_touched(self):
-        # If REMOTE was already matched (in resolved_ids), it's not raw → skip.
-        segs = [
-            Segment(start=0.0, end=10.0, text="openoms", speaker="Openoms"),
-            Segment(start=10.2, end=10.6, text="yeah", speaker="REMOTE"),
-        ]
-        txn = self._txn(segs)
-        absorb = absorb_unresolved_remote(txn, {"Openoms", "REMOTE"})
-        assert absorb == {}
-
-    def test_raw_speaker_n_also_absorbed(self):
-        # A leftover raw SPEAKER_n (not just literal REMOTE) is eligible too.
-        segs = [
-            Segment(start=0.0, end=10.0, text="openoms", speaker="Openoms"),
-            Segment(start=10.2, end=10.6, text="yeah", speaker="SPEAKER_03"),
-        ]
-        txn = self._txn(segs)
-        absorb = absorb_unresolved_remote(txn, {"Openoms"})
-        assert absorb == {"SPEAKER_03": "Openoms"}
+        # A REMOTE that voiceprint already named keeps its name.
+        txn = _raw_txn(_devstandup_segments())
+        assert crosstalk_label_map(txn, {"REMOTE"}) == {}
 
 
 # ─── absorb_tiny_speakers: fold spurious noise into the DOMINANT speaker (A2) ─
-# Complements absorb_unresolved_remote for the common case where the dominant
-# speaker is itself an unmatched SPEAKER_n: a single 1-3 segment / few-second
-# REMOTE blip should fold into the real conversation rather than force review.
+# A single 1-3 segment / few-second raw blip (typically a SPEAKER_n split off by
+# pyannote) folds into the real conversation rather than forcing review.
 
 class TestAbsorbTinySpeakers:
     def _txn(self, segments):
@@ -813,9 +926,8 @@ class TestAbsorbTinySpeakers:
             Segment(start=864.0, end=866.1, text="Fine.", speaker="REMOTE"),
         ]
         txn = self._txn(segs)
-        # No named speaker → absorb_unresolved_remote can't help.
-        assert absorb_unresolved_remote(txn, set()) == {}
-        # But the tiny REMOTE folds into the dominant raw speaker.
+        # The tiny REMOTE (not ghost-shaped: 1.1 s + 2.1 s) folds into the
+        # dominant raw speaker.
         assert absorb_tiny_speakers(txn, set()) == {"REMOTE": "SPEAKER_00"}
 
     def test_tiny_remote_folds_into_named_when_present(self):
@@ -879,6 +991,70 @@ class TestAbsorbTinySpeakers:
                                 text="x", speaker="REMOTE"))
         txn = self._txn(segs)
         assert absorb_tiny_speakers(txn, set()) == {}
+
+    def test_short_voiceprint_match_is_not_noise(self):
+        # Regression: the CLI passed label-map VALUES (names), so a short raw
+        # cluster voiceprint had confidently matched (SPEAKER_01 → Andrej)
+        # still counted as unresolved noise and was folded into Kemal.
+        segs = [
+            Segment(start=0.0, end=60.0, text="a", speaker="SPEAKER_00"),
+            Segment(start=61.0, end=63.0, text="short matched guy", speaker="SPEAKER_01"),
+        ]
+        txn = self._txn(segs)
+        label_map = {"SPEAKER_00": "Kemal", "SPEAKER_01": "Andrej"}
+        assert absorb_tiny_speakers(txn, set(label_map)) == {}
+
+
+# ─── millet label --auto on a raw-id session (end to end, voiceprint mocked) ─
+
+class TestLabelAutoCrosstalk:
+    """`label --auto` exactly as vezir's worker runs it: non-interactive,
+    --no-audio --no-summary, on a fresh transcript that still has raw ids."""
+
+    def _session(self, tmp_path):
+        sdir = tmp_path / "01M3RS442M3XX4D2AGK80641A7"
+        sdir.mkdir()
+        _raw_txn(_devstandup_segments()).save(sdir, basename=sdir.name)
+        # Existence is all the CLI checks; channel detection is mocked.
+        (sdir / f"{sdir.name}.ogg").write_bytes(b"")
+        return sdir
+
+    def _run(self, sdir, matches):
+        from click.testing import CliRunner
+
+        from millet.cli.label import label as label_cmd
+        from millet.voiceprint import SpeakerMatch
+
+        m = {sid: SpeakerMatch(name, 0.95, 60.0, 0.5) for sid, name in matches.items()}
+        with patch("millet.label._detect_speaker_channels", return_value={}), \
+             patch("millet.voiceprint.load_profiles", return_value={"x": object()}), \
+             patch("millet.voiceprint.identify_speakers", return_value=m), \
+             patch("millet.voiceprint.update_profiles_from_confirmed_labels") as upd:
+            result = CliRunner().invoke(
+                label_cmd, [str(sdir), "--auto", "--no-audio", "--no-summary"],
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads((sdir / f"{sdir.name}.json").read_text())
+        return data, upd, result.output
+
+    def test_ghost_remote_becomes_crosstalk_and_matches_apply(self, tmp_path):
+        sdir = self._session(tmp_path)
+        data, upd, out = self._run(sdir, {"SPEAKER_00": "Kemal", "SPEAKER_01": "Lukas"})
+        ids = {sp["id"] for sp in data["speakers"]}
+        assert ids == {"Kemal", "Lukas", CROSSTALK}
+        bye = [s for s in data["segments"] if s["text"] == "Bye."]
+        assert bye and all(s["speaker"] == CROSSTALK for s in bye)
+        assert "cannot be assigned to a speaker" in out
+        # Neither the voiceprint matches nor CROSSTALK feed the voiceprint DB.
+        upd.assert_not_called()
+
+    def test_crosstalk_without_any_voiceprint_match(self, tmp_path):
+        sdir = self._session(tmp_path)
+        data, upd, _ = self._run(sdir, {})
+        ids = {sp["id"] for sp in data["speakers"]}
+        # The real clusters stay raw (a human names them); the ghost doesn't.
+        assert ids == {"SPEAKER_00", "SPEAKER_01", CROSSTALK}
+        upd.assert_not_called()
 
 
 # ─── millet label --apply-json (non-interactive embedder mode) ──────────────

@@ -13,13 +13,14 @@ import json
 import subprocess
 import tempfile
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from millet.audio import compute_speaker_channel_energy, read_stereo_channels
+from millet.crosstalk import CROSSTALK, ghost_speakers, is_reserved_label
 from millet.transcribe import Segment, Speaker, Transcript
 
 # ─── Data ───────────────────────────────────────────────────────────────────
@@ -350,24 +351,16 @@ def play_clip(clip_path: str | Path) -> subprocess.Popen:
     )
 
 
-# ─── Rescue the leftover REMOTE bucket (A1, 0.12.12) ─────────────────────────
+# ─── Leftover REMOTE bucket → CROSSTALK; tiny noise → dominant speaker ──────
 
 import re as _re  # noqa: E402
 
 # Raw, auto-generated speaker ids that mean "not yet identified".
 _RAW_SPEAKER_RE = _re.compile(r"^(REMOTE(?:_\d+)?|SPEAKER_\d+)$")
 
-# A leftover REMOTE bucket is only auto-absorbed when it's SMALL — it's the
-# catch-all for unassigned system segments + non-overlapping mic-bleed, i.e.
-# short backchannel from several people that won't voiceprint-match cleanly.
-# Above these limits we keep it raw so a human reviews a substantial unknown.
-REMOTE_ABSORB_MAX_SECONDS = 30.0
-REMOTE_ABSORB_MAX_SEGMENTS = 25
-
 # A "tiny" raw cluster is spurious noise — a one-liner backchannel or heavily
 # distorted blip on the system channel that diarization split off and that
-# voiceprint can't match.  Unlike ``absorb_unresolved_remote`` (which needs a
-# *named* target), a tiny cluster is folded into the DOMINANT speaker by speech
+# voiceprint can't match.  It is folded into the DOMINANT speaker by speech
 # time even when that dominant speaker is itself still raw/unmatched, so a
 # single noise blip no longer forces an otherwise-clean session into review.
 TINY_SPEAKER_MAX_SECONDS = 5.0
@@ -378,80 +371,28 @@ def _is_raw_speaker(sid: str) -> bool:
     return bool(_RAW_SPEAKER_RE.match(sid or ""))
 
 
-def absorb_unresolved_remote(
+def crosstalk_label_map(
     transcript: Transcript,
     resolved_ids: set[str],
 ) -> dict[str, str]:
-    """Map small unresolved raw clusters onto the named speaker they overlap.
+    """Map every ghost ``REMOTE``/``REMOTE_N`` bucket to :data:`CROSSTALK`.
 
-    The dual-diarize path creates a literal ``REMOTE`` bucket (and can leave
-    raw ``SPEAKER_n``) *after* cluster consolidation runs, so it never gets a
-    chance to merge and its mixed/thin backchannel audio rarely voiceprint-
-    matches.  That single leftover then forces the whole session into
-    needs_labeling even when every real participant was identified.
+    The dual-diarize path creates a literal ``REMOTE`` bucket *after* cluster
+    consolidation, so it never merges; it collects sub-second fillers from
+    several people that no voiceprint can match.  Rather than guess an owner,
+    a bucket that looks like filler crosstalk (see
+    :func:`millet.crosstalk.is_ghost_speaker`) is labeled ``CROSSTALK`` —
+    honest, human-readable, and no longer an unresolved speaker.  Several
+    ghost buckets collapse into one ``CROSSTALK`` speaker.  A substantial
+    ``REMOTE`` is left raw for human review.
 
-    For each raw cluster that is SMALL (≤ ``REMOTE_ABSORB_MAX_SECONDS`` of
-    speech and ≤ ``REMOTE_ABSORB_MAX_SEGMENTS`` segments), find the *named*
-    (resolved) speaker whose segments overlap it most in time and absorb it
-    there.  Large unknowns are left raw for human review (unchanged behavior).
-
-    Returns ``{raw_id: resolved_name}`` for clusters to absorb (possibly empty).
-    Pure/deterministic; the caller folds the result into the label_map.
+    ``resolved_ids`` are the *raw* ids already mapped to a name (the keys of
+    the label map) — they are never touched.  Pure/deterministic.
     """
-    # Per-raw-cluster: total speech + segment list; per-named: time intervals.
-    raw_speech: dict[str, float] = {}
-    raw_count: dict[str, int] = {}
-    raw_segs: dict[str, list[tuple[float, float]]] = {}
-    named_segs: dict[str, list[tuple[float, float]]] = {}
-    for seg in transcript.segments:
-        sid = seg.speaker or ""
-        if not sid:
-            continue
-        s, e = float(seg.start), float(seg.end)
-        if _is_raw_speaker(sid) and sid not in resolved_ids:
-            raw_speech[sid] = raw_speech.get(sid, 0.0) + max(0.0, e - s)
-            raw_count[sid] = raw_count.get(sid, 0) + 1
-            raw_segs.setdefault(sid, []).append((s, e))
-        elif sid in resolved_ids:
-            named_segs.setdefault(sid, []).append((s, e))
-
-    if not raw_segs or not named_segs:
-        return {}
-
-    def _overlap(a: tuple[float, float], intervals: list[tuple[float, float]]) -> float:
-        # Sum of temporal overlap of `a` with a named speaker's intervals,
-        # plus a tie-break proximity bonus (inverse distance to nearest).
-        s0, e0 = a
-        total = 0.0
-        nearest = float("inf")
-        for s1, e1 in intervals:
-            ov = min(e0, e1) - max(s0, s1)
-            if ov > 0:
-                total += ov
-            else:
-                nearest = min(nearest, max(s1 - e0, s0 - e1))
-        if total > 0:
-            return total
-        # No direct overlap → small negative score by distance so the closest
-        # named speaker still wins over a far one (REMOTE one-liners between
-        # turns).  Scaled to stay below any real overlap.
-        return -nearest if nearest != float("inf") else -1e9
-
-    absorb: dict[str, str] = {}
-    for rid, segs in raw_segs.items():
-        if raw_speech.get(rid, 0.0) > REMOTE_ABSORB_MAX_SECONDS:
-            continue
-        if raw_count.get(rid, 0) > REMOTE_ABSORB_MAX_SEGMENTS:
-            continue
-        scores: dict[str, float] = {}
-        for s, e in segs:
-            for name, intervals in named_segs.items():
-                scores[name] = scores.get(name, 0.0) + _overlap((s, e), intervals)
-        if not scores:
-            continue
-        best = max(scores, key=lambda n: scores[n])
-        absorb[rid] = best
-    return absorb
+    return {
+        sid: CROSSTALK
+        for sid in ghost_speakers(transcript.segments, resolved_ids)
+    }
 
 
 def absorb_tiny_speakers(
@@ -460,13 +401,16 @@ def absorb_tiny_speakers(
 ) -> dict[str, str]:
     """Fold spurious *tiny* raw clusters into the dominant speaker.
 
-    Complements :func:`absorb_unresolved_remote`, which only works when a
-    *named* speaker exists to absorb into.  In the common failure case the
-    dominant speaker is itself an unmatched ``SPEAKER_n`` and the only leftover
-    is a 1-3 segment / few-second ``REMOTE`` (a backchannel one-liner or a
-    distorted noise blip).  That single tiny cluster otherwise forces the whole
-    session into ``needs_labeling`` even though there is nothing meaningful to
-    label.
+    Runs after :func:`crosstalk_label_map`, so ghost ``REMOTE`` buckets are
+    already ``CROSSTALK``; what remains here is a 1-3 segment / few-second raw
+    cluster (a backchannel one-liner or a distorted noise blip) — typically a
+    ``SPEAKER_n`` split off by pyannote.  That single tiny cluster otherwise
+    forces the whole session into ``needs_labeling`` even though there is
+    nothing meaningful to label.
+
+    ``resolved_ids`` are the *raw* ids already mapped to a name (label-map
+    keys, not the names): a short cluster that voiceprint confidently matched
+    is not noise and must keep its match.
 
     For each raw cluster that is TINY (``<= TINY_SPEAKER_MAX_SECONDS`` of speech
     AND ``<= TINY_SPEAKER_MAX_SEGMENTS`` segments) and not already resolved,
@@ -668,8 +612,18 @@ def apply_labels(
                 # primary auto-detected summary).
                 effective_language = summary_language or transcript.language
                 lang_suffix = summary_language or None
+                # CROSSTALK lines are unattributable fillers ("Bye.", "Yeah.")
+                # — no content, and the model would list "CROSSTALK" as a
+                # participant.  They stay in txt/srt/json/PDF, not the summary.
+                summary_input = replace(
+                    transcript,
+                    segments=[
+                        s for s in transcript.segments
+                        if not is_reserved_label(s.speaker)
+                    ],
+                )
                 summary_result = do_summarize(
-                    transcript.to_text(), summary_config,
+                    summary_input.to_text(), summary_config,
                     language=effective_language,
                 )
                 from millet.frontmatter import context_from_transcript
@@ -755,6 +709,12 @@ def apply_labels(
             for p in fm_dict.get("participants") or []:
                 if isinstance(p, dict) and isinstance(p.get("name"), str):
                     p["name"] = _replace_all(p["name"])
+            # A participant relabeled to CROSSTALK is not a person — drop it.
+            if isinstance(fm_dict.get("participants"), list):
+                fm_dict["participants"] = [
+                    p for p in fm_dict["participants"]
+                    if not (isinstance(p, dict) and is_reserved_label(p.get("name")))
+                ]
             for ai in fm_dict.get("action_items") or []:
                 if isinstance(ai, dict):
                     if isinstance(ai.get("assignee"), str):

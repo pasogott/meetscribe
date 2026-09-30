@@ -499,47 +499,54 @@ def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backe
                 )
         click.echo()
 
-    # ── Rescue the leftover REMOTE bucket (A1) ──
-    # The dual-diarize path creates a literal REMOTE (and can leave raw
-    # SPEAKER_n) AFTER consolidation runs, so it never merges and its mixed/thin
-    # backchannel rarely voiceprint-matches.  When every real participant was
-    # identified, that single small leftover shouldn't force needs_labeling.
-    # Absorb a SMALL unresolved raw cluster into the named speaker it overlaps
-    # most in time.  Only when at least one speaker was named (so we have a
-    # target) and we're in auto mode.
-    if auto and applied_matches and transcript is not None:
-        from millet.label import absorb_unresolved_remote
+    # Raw ids whose label was *derived* here (CROSSTALK, tiny-noise folds)
+    # rather than voiceprint-matched or typed by a human.  They must never
+    # feed the voiceprint DB: a fold is a guess and CROSSTALK is mixed audio.
+    synthetic_ids: set[str] = set()
 
-        resolved_ids = set(label_map.values())
-        absorb = absorb_unresolved_remote(transcript, resolved_ids)
-        if absorb:
-            click.echo("Absorbing leftover unidentified remote segments:")
-            for raw_id, name in sorted(absorb.items()):
+    # NOTE: both passes below take the *raw* ids already resolved — the keys
+    # of label_map.  The transcript still carries raw ids at this point, so
+    # passing the names (label_map.values()) matches nothing: that bug made
+    # the 0.12.12 REMOTE rescue a silent no-op in production, and let the
+    # tiny-noise fold overwrite a short-but-confident voiceprint match.
+
+    # ── Ghost REMOTE bucket → CROSSTALK ──
+    # The dual-diarize path leaves a literal REMOTE bucket of sub-second
+    # fillers ("Bye.", "Yeah.") from several people that no voiceprint can
+    # match.  Rather than guess an owner, label it CROSSTALK: honest, readable,
+    # and no longer an unresolved speaker, so it can't force needs_labeling.
+    # Needs no named target; a substantial REMOTE stays raw for a human.
+    if auto and transcript is not None:
+        from millet.label import crosstalk_label_map
+
+        crosstalk = crosstalk_label_map(transcript, set(label_map))
+        if crosstalk:
+            click.echo("Labeling unattributable filler crosstalk:")
+            for raw_id, name in sorted(crosstalk.items()):
                 label_map[raw_id] = name
+                synthetic_ids.add(raw_id)
                 click.echo(
-                    f"  {raw_id} -> {click.style(name, fg='green')}  "
-                    f"(overlap-absorbed)"
+                    f"  {raw_id} -> {click.style(name, fg='yellow')}  "
+                    f"(cannot be assigned to a speaker)"
                 )
             click.echo()
-            # These are now resolved → drop from the unrecognized set.
             unrecognized = [sp for sp in speakers if sp.id not in label_map]
 
-    # ── Fold spurious TINY noise clusters into the dominant speaker (A2) ──
-    # A backchannel one-liner or distorted blip on the system channel becomes
-    # its own raw cluster that voiceprint can't match.  Unlike the rescue above
-    # this needs no NAMED target — it folds the tiny cluster into whoever speaks
-    # most (even another raw id), so a single noise blip can't force an
-    # otherwise-clean session into needs_labeling.  Runs in auto mode even when
-    # no confident voiceprint match was applied.
+    # ── Fold spurious TINY noise clusters into the dominant speaker ──
+    # A backchannel one-liner or distorted blip becomes its own raw cluster
+    # that voiceprint can't match.  Fold it into whoever speaks most (even
+    # another raw id), so a single noise blip can't force an otherwise-clean
+    # session into needs_labeling.  Runs in auto mode even when no confident
+    # voiceprint match was applied.
     if auto and transcript is not None:
         from millet.label import absorb_tiny_speakers
 
-        resolved_ids = set(label_map.values())
-        tiny_absorb = absorb_tiny_speakers(transcript, resolved_ids)
+        tiny_absorb = absorb_tiny_speakers(transcript, set(label_map))
         if tiny_absorb:
             click.echo("Folding tiny noise speaker(s) into the dominant speaker:")
             for raw_id, target in sorted(tiny_absorb.items()):
                 label_map[raw_id] = label_map.get(target, target)
+                synthetic_ids.add(raw_id)
                 click.echo(
                     f"  {raw_id} -> {click.style(label_map[raw_id], fg='green')}  "
                     f"(tiny-noise-absorbed)"
@@ -676,16 +683,18 @@ def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backe
     # updating profiles from incorrect matches causes profile drift.
     if auto and label_map:
         # manual_labels: speakers the user typed a name for during this session
+        # (never derived labels: CROSSTALK / tiny-noise folds are not a person
+        # confirmed by a human).
         manual_labels = {
             sp_id: name
             for sp_id, name in label_map.items()
-            if sp_id not in auto_matches
+            if sp_id not in auto_matches and sp_id not in synthetic_ids
         }
-        profile_labels = label_map if not auto_matches else manual_labels
+        profile_labels = manual_labels
         if not profile_labels:
             click.echo()
             click.echo(
-                "  Skipping profile update (all labels were auto-matched; "
+                "  Skipping profile update (no manually confirmed labels; "
                 "use 'meet enroll' to update profiles from verified labels)."
             )
         else:

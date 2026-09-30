@@ -36,6 +36,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from millet.crosstalk import is_reserved_label
+
 SCHEMA_VERSION = 1
 
 # Allowed values for the ``type`` field. Kept narrow on purpose; "memo" and
@@ -290,7 +292,8 @@ def build_frontmatter(
     if not transcript_names and context.speaker_channels:
         transcript_names = list(context.speaker_channels.keys())
     for name in transcript_names:
-        if not name:
+        # CROSSTALK (unattributable fillers) is not a participant.
+        if not name or is_reserved_label(name):
             continue
         seen[name] = {
             "name": name,
@@ -299,7 +302,7 @@ def build_frontmatter(
         }
     for raw in extracted.get("participants") or []:
         norm = _normalize_participant_from_extraction(raw)
-        if not norm:
+        if not norm or is_reserved_label(norm["name"]):
             continue
         existing = seen.get(norm["name"])
         if existing:

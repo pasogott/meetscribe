@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.21.4 — label ghost REMOTE buckets as CROSSTALK
+
+A leftover `REMOTE` bucket of sub-second fillers ("Bye.", "Yeah.", "Hmm.")
+forced about half of all team meetings into `needs_labeling` even when every
+real participant had been identified by voiceprint; the scribe then opened
+the session only to *not* label it.  Measured on 257 real transcripts: 55
+such buckets had been left unnamed by a human.
+
+### Changed
+
+* **`label --auto` labels a ghost `REMOTE`/`REMOTE_N` bucket `CROSSTALK`.**
+  The honest technical reason, readable by a human: these words were heard
+  but cannot be assigned to a speaker.  No owner is guessed.  A bucket is a
+  ghost (`millet.crosstalk.is_ghost_speaker`) when its words are ≤ 2% of the
+  meeting's (≤ 150), its median segment is ≤ 1 s, and at most 2 of its
+  segments exceed 6 words.  Judged in words, not seconds — Whisper stretches
+  filler timestamps ("No, no, no." over 22.6 s).  Several ghost buckets
+  collapse into one `CROSSTALK` speaker; a substantial `REMOTE` stays raw
+  for a human.  Replay: 49/55 unnamed buckets → `CROSSTALK` (the other 6
+  are single blips the tiny-noise fold already handles, or real speech);
+  1/120 buckets humans had named a real person would have been labeled
+  `CROSSTALK` (two greetings, 1.9 s).
+* **`CROSSTALK` is reserved.**  It is never enrolled or updated as a
+  voiceprint and never matched (a stored profile of that name is ignored),
+  never listed as a participant (frontmatter, PDF header), and its lines are
+  left out of the summary input.  They stay in the txt/srt/json/PDF
+  transcript under that label.
+* Replaces the 0.12.12 overlap-absorb of a small `REMOTE` into the nearest
+  named speaker (`absorb_unresolved_remote`, removed) — see below.
+
+### Fixed
+
+* **The 0.12.12 REMOTE rescue never ran in production.**  `label --auto`
+  passed the label map's *names* as the resolved set while the transcript
+  still carried *raw* ids, so no named target was ever found.  Its tests
+  used pre-named transcripts, which hid it.  The new tests start from raw
+  ids, as production does.
+* **The tiny-noise fold could overwrite a confident voiceprint match.**  Same
+  names-vs-ids mix-up: a short cluster voiceprint had matched (e.g. 2 s →
+  Andrej) still counted as unresolved noise and was folded into the dominant
+  speaker.  Resolved raw ids are now passed.
+* **`label --auto` fed derived labels into the voiceprint DB.**  Labels it
+  derives itself (tiny-noise folds, `CROSSTALK`) counted as "manually
+  confirmed" and updated profiles — with no voiceprint matches at all, the
+  whole label map did.  Only labels a human typed update profiles now.
+
 ## v0.21.3 — cap summary frames at the endpoint's 10-image request limit
 
 Incident 2026-09-17 (vezir/saray): the first screen recording long enough

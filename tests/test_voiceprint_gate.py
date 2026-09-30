@@ -243,3 +243,38 @@ def test_single_cluster_per_profile_unchanged(monkeypatch):
     )
     assert matches["SPEAKER_00"].name == "Destiny"
     assert matches["SPEAKER_01"].name == "Andrej"
+
+
+# ─── CROSSTALK is reserved: never enrolled, never matched ────────────────────
+# CROSSTALK is mixed audio from several people.  A profile built from it would
+# later "match" real speakers, so no path may create or use one.
+
+
+def test_crosstalk_profile_is_never_matched(monkeypatch):
+    """Even if an older build enrolled a CROSSTALK profile, identify ignores it."""
+    crosstalk = _unit(1.0, 0.0, 0.0)
+    kemal = _unit(0.0, 1.0, 0.0)
+    matches = _run_identify(
+        monkeypatch,
+        cluster_embeddings={"SPEAKER_00": crosstalk, "SPEAKER_01": kemal},
+        profiles={
+            "CROSSTALK": SpeakerProfile("CROSSTALK", crosstalk, 5),
+            "Kemal": SpeakerProfile("Kemal", kemal, 5),
+        },
+    )
+    assert "SPEAKER_00" not in matches
+    assert matches["SPEAKER_01"].name == "Kemal"
+
+
+def test_crosstalk_label_never_updates_profiles(monkeypatch):
+    """A reserved label short-circuits before any embedding work."""
+    from pathlib import Path
+
+    def boom():
+        raise AssertionError("embedding model must not load for CROSSTALK")
+
+    monkeypatch.setattr(_vp, "_get_inference", boom)
+    _vp.update_profiles_from_confirmed_labels(
+        Path("/tmp/fake.ogg"), [], {"REMOTE": "CROSSTALK"}, {},
+        profiles_path=Path("/tmp/profiles.json"),
+    )

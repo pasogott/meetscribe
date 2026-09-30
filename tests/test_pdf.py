@@ -202,3 +202,28 @@ class TestAttestationVsConfidential:
         doc = self._template()
         assert doc._confidential is False
         assert doc._attested is False
+
+
+class TestCrosstalkNotAParticipant:
+    def test_header_lists_people_only(self, tmp_path, monkeypatch):
+        from millet import pdf as _pdf
+
+        seen: list[str] = []
+        real_escape = _pdf._escape_xml
+
+        def spy(text):
+            seen.append(text)
+            return real_escape(text)
+
+        monkeypatch.setattr(_pdf, "_escape_xml", spy)
+        t = Transcript(
+            segments=[
+                Segment(start=0.0, end=5.0, text="hello", speaker="Kemal"),
+                Segment(start=6.0, end=6.2, text="Bye.", speaker="CROSSTALK"),
+            ],
+            speakers=[Speaker(id="Kemal", label="Kemal"),
+                      Speaker(id="CROSSTALK", label="CROSSTALK")],
+            language="en", audio_file="x.ogg", duration=10.0,
+        )
+        generate_pdf(t, tmp_path / "out.pdf")
+        assert "Participants: Kemal" in seen
