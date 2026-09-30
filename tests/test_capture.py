@@ -41,6 +41,10 @@ def _make_session(tmp_path: Path) -> RecordingSession:
 def _fake_popen(*args, **kwargs):
     """Return a mock Popen that looks alive (poll() returns None)."""
     proc = MagicMock()
+    # No real process: millet-record >= 0.6.0 writes a .recorder.json marker
+    # for a truthy pid, and a MagicMock pid is not JSON-serializable.  A
+    # falsy pid takes its documented "test double" skip path.
+    proc.pid = None
     proc.poll.return_value = None
     proc.stdin = MagicMock()
     proc.wait.return_value = 0

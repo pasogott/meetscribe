@@ -45,6 +45,10 @@ such buckets had been left unnamed by a human.
   derives itself (tiny-noise folds, `CROSSTALK`) counted as "manually
   confirmed" and updated profiles — with no voiceprint matches at all, the
   whole label map did.  Only labels a human typed update profiles now.
+* **CI red since millet-record 0.6.0** (test-only).  Its new `.recorder.json`
+  marker `json.dumps` the recorder's pid; the `test_capture` fake Popen was a
+  bare `MagicMock` whose `pid` is a truthy mock.  The fake now has
+  `pid = None`, millet-record's documented skip path for test doubles.
 
 ## v0.21.3 — cap summary frames at the endpoint's 10-image request limit
 
