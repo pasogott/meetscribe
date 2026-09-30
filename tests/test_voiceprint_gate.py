@@ -278,3 +278,96 @@ def test_crosstalk_label_never_updates_profiles(monkeypatch):
         Path("/tmp/fake.ogg"), [], {"REMOTE": "CROSSTALK"}, {},
         profiles_path=Path("/tmp/profiles.json"),
     )
+
+
+# ─── Learning hygiene: only dense real speech builds a profile ───────────────
+# The "Pattern" incident (vezir, 2026-09): profile updates took a cluster's
+# LONGEST segments — for a filler cluster, fillers Whisper stretched over
+# silence, i.e. room tone + the scribe's echo.  The profile ended up 0.86 to
+# the scribe's echo and 0.10 to the person it was named after, then matched
+# filler buckets in every meeting at ~0.9.
+
+from millet.voiceprint import (  # noqa: E402
+    LEARN_MIN_SPEECH_SECONDS,
+    learnable_segments,
+)
+
+
+def _pattern_cluster(sid="Pattern"):
+    """Filler cluster as it appeared on 01M3QN8F: stretched 'Yeah.'s."""
+    return [
+        Segment(start=10.0, end=16.7, text="Yeah.", speaker=sid),
+        Segment(start=40.0, end=45.2, text="Okay.", speaker=sid),
+        Segment(start=80.0, end=82.3, text="Mm-hmm.", speaker=sid),
+        Segment(start=95.0, end=97.1, text="So it's a bot management interface.", speaker=sid),
+        Segment(start=120.0, end=120.4, text="Bye.", speaker=sid),
+    ]
+
+
+def test_filler_cluster_is_not_learnable():
+    assert learnable_segments(_pattern_cluster(), "Pattern") == []
+
+
+def test_dense_speech_is_learnable_most_words_first():
+    segs = [
+        Segment(start=0.0, end=4.0, text="we shipped the migration fix this morning finally", speaker="G"),
+        Segment(start=10.0, end=16.7, text="Yeah.", speaker="G"),  # stretched filler: excluded
+        Segment(start=20.0, end=23.0, text="and the payouts look right on staging now", speaker="G"),
+        Segment(start=30.0, end=31.0, text="one two three four five six", speaker="G"),  # < 1.5 s
+    ]
+    assert learnable_segments(segs, "G") == [(0.0, 4.0), (20.0, 23.0)]
+    assert LEARN_MIN_SPEECH_SECONDS == 4.0
+
+
+def test_too_little_dense_speech_is_not_learnable():
+    segs = [Segment(start=0.0, end=2.0, text="we shipped the migration fix today", speaker="G")]
+    assert learnable_segments(segs, "G") == []
+
+
+def test_filler_cluster_never_updates_a_profile(monkeypatch):
+    """Confirming a filler cluster's (pre-filled) name must not touch the DB."""
+    from pathlib import Path
+
+    def boom(*a, **k):
+        raise AssertionError("must not embed or write for a filler cluster")
+
+    monkeypatch.setattr(_vp, "_get_inference", boom)
+    monkeypatch.setattr(_vp, "save_profiles", boom)
+    _vp.update_profiles_from_confirmed_labels(
+        Path("/tmp/fake.ogg"), _pattern_cluster(), {"Pattern": "Pattern"},
+        {"Pattern": "system"}, profiles_path=Path("/tmp/profiles.json"),
+    )
+
+
+def test_update_learns_from_dense_spans_only(monkeypatch):
+    from pathlib import Path
+
+    seen: dict = {}
+    monkeypatch.setattr(_vp, "_get_inference", lambda: object())
+    monkeypatch.setattr(_vp, "load_profiles", lambda profiles_path=None: {})
+    monkeypatch.setattr(
+        _vp, "_extract_channel_audio",
+        lambda audio_path, channel: (np.ones(16000, dtype=np.float32), 16000),
+    )
+
+    def fake_embed(samples, sr, selected, inference):
+        seen["spans"] = list(selected)
+        return _unit(1.0, 0.0, 0.0)
+
+    monkeypatch.setattr(_vp, "_embed_segments", fake_embed)
+    monkeypatch.setattr(_vp, "save_profiles", lambda p, profiles_path=None: seen.update(saved=p))
+    segs = _pattern_cluster("SPEAKER_01") + [
+        Segment(start=200.0, end=204.0, text="we shipped the migration fix this morning finally",
+                speaker="SPEAKER_01"),
+        Segment(start=210.0, end=213.0, text="and the payouts look right on staging now",
+                speaker="SPEAKER_01"),
+    ]
+    _vp.update_profiles_from_confirmed_labels(
+        Path("/tmp/fake.ogg"), segs, {"SPEAKER_01": "Gustavo"}, {"SPEAKER_01": "system"},
+        profiles_path=Path("/tmp/profiles.json"),
+    )
+    # Neither the stretched "Yeah." (6.7 s) nor "Okay." (5.2 s) — the longest
+    # segments, which the old selection preferred — reach the embedding; the
+    # one real line in the filler part does (6 words in 2.1 s), most words first.
+    assert seen["spans"] == [(200.0, 204.0), (210.0, 213.0), (95.0, 97.1)]
+    assert "Gustavo" in seen["saved"]

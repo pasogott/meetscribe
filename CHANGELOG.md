@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.21.5 — voiceprints learn only from real speech; CROSSTALK beats a voiceprint match
+
+Incident 2026-09-30 (vezir, blink team): a profile named "Pattern" (a
+teammate's handle) appeared in dev standups, sales calls and interviews,
+always on the same shape of text — "Okay. | Yeah. | Bye." at ~1 word/s — and
+once on a colleague's self-introduction.  Measured on the live DB it sat
+**0.10** from the voice of the person it was named after and **0.86** from
+the *scribe's own voice echoing back through the call* on the system
+channel.  It had been built from filler, then reinforced on every labeling
+submit that confirmed its (pre-filled) match — five running-average merges,
+none reversible.  It also defeated 0.21.4: the filler bucket matched
+"Pattern" at ~0.9 *before* the CROSSTALK rule could see it.
+
+### Fixed
+
+* **Profiles learned from the longest segments — for filler, the worst
+  ones.**  Enroll and update-from-labels picked a cluster's longest
+  segments; for a filler cluster those are fillers Whisper stretched over
+  silence ("Yeah." across 6.7 s): room tone and echo.  Learning now uses
+  `learnable_segments()`: dense speech only (≥ 1.5 s, ≥ 6 words, ≥ 1.5
+  words/s), most words first, and nothing at all under 4 s of it (the same
+  floor that gates auto-apply).  A filler/echo cluster can no longer create
+  or update a profile, however often its name is confirmed.  Matching is
+  unchanged.
+* **A ghost REMOTE bucket now becomes CROSSTALK even when a voiceprint
+  matches it.**  Filler from several people has no single voice to match; a
+  confident match on it means a polluted profile, not a person.  The match
+  is logged ("Ignoring voiceprint match … filler crosstalk") and not offered
+  as an auto-id suggestion.  Replay data: 1 in 120 ghost-shaped buckets was
+  ever one real person.
+
 ## v0.21.4 — label ghost REMOTE buckets as CROSSTALK
 
 A leftover `REMOTE` bucket of sub-second fillers ("Bye.", "Yeah.", "Hmm.")

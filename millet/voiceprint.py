@@ -112,6 +112,48 @@ MATCH_MANY_TO_ONE_CONFIDENCE = 0.80
 # speakers.
 MIN_SEGMENT_RMS = 0.0015
 
+# ─── What a profile may LEARN from (enroll / update-from-labels) ─────────────
+# Matching is forgiving; learning must not be.  A profile is a running average
+# with no memory of what went in, so one bad update can't be taken back.
+#
+# The trap: picking a cluster's LONGEST segments.  For a filler cluster those
+# are the fillers Whisper stretched over silence ("Yeah." spanning 6.7 s) —
+# audio that is mostly room tone and, on the system channel, the scribe's own
+# voice echoing back through the call.  vezir's "Pattern" profile was built
+# that way (cosine 0.86 to the scribe's echo, 0.10 to the person it was named
+# after) and then matched filler buckets across every meeting at ~0.9.
+#
+# So only DENSE speech is learned from: segments carrying real words at a
+# speaking rate, most-words-first, and only when enough of it exists.
+LEARN_MIN_WORDS = 6                  # a real utterance, not "Okay."
+LEARN_MIN_WORDS_PER_SECOND = 1.5     # speech, not a filler stretched over silence
+LEARN_MIN_SPEECH_SECONDS = MATCH_MIN_SPEECH_SECONDS  # same floor as auto-apply
+
+
+def learnable_segments(transcript_segments: list, speaker_id: str) -> list[tuple[float, float]]:
+    """``(start, end)`` spans of ``speaker_id`` fit to learn a voiceprint from.
+
+    Dense segments only (>= :data:`MIN_SEGMENT_DURATION`,
+    >= :data:`LEARN_MIN_WORDS` words, >= :data:`LEARN_MIN_WORDS_PER_SECOND`),
+    most words first, at most :data:`MAX_SEGMENTS_PER_SPEAKER`.  Returns
+    ``[]`` when their total is under :data:`LEARN_MIN_SPEECH_SECONDS` — a
+    filler / echo / silence cluster must never create or update a profile.
+    """
+    dense: list[tuple[int, float, float]] = []
+    for seg in transcript_segments:
+        if seg.speaker != speaker_id:
+            continue
+        dur = seg.end - seg.start
+        words = len((getattr(seg, "text", "") or "").split())
+        if (dur >= MIN_SEGMENT_DURATION and words >= LEARN_MIN_WORDS
+                and words / dur >= LEARN_MIN_WORDS_PER_SECOND):
+            dense.append((words, seg.start, seg.end))
+    dense.sort(key=lambda d: d[0], reverse=True)
+    selected = [(s, e) for _, s, e in dense[:MAX_SEGMENTS_PER_SPEAKER]]
+    if sum(e - s for s, e in selected) < LEARN_MIN_SPEECH_SECONDS:
+        return []
+    return selected
+
 
 # ─── Embedding model loading ──────────────────────────────────────────────────
 
@@ -424,27 +466,16 @@ def extract_speaker_embeddings(
     """
     inference = _get_inference()
 
-    # Group segments by speaker
-    segs_by_speaker: dict[str, list[tuple[float, float]]] = {}
-    for seg in transcript_segments:
-        if not seg.speaker or seg.speaker not in speaker_labels:
-            continue
-        duration = seg.end - seg.start
-        if duration < MIN_SEGMENT_DURATION:
-            continue
-        segs_by_speaker.setdefault(seg.speaker, []).append((seg.start, seg.end))
-
-    # For each speaker, pick the longest segments up to MAX_SEGMENTS_PER_SPEAKER
+    # For each speaker, only dense real speech is learned from (see
+    # learnable_segments) — the same gate as update_profiles_from_confirmed_labels.
     result: dict[str, np.ndarray] = {}
     for speaker_id, name in speaker_labels.items():
-        segs = segs_by_speaker.get(speaker_id, [])
-        if not segs:
-            log.debug("No suitable segments for speaker %s (%s)", speaker_id, name)
+        if is_reserved_label(name):
             continue
-
-        # Sort by duration descending, take top N
-        segs.sort(key=lambda s: s[1] - s[0], reverse=True)
-        selected = segs[:MAX_SEGMENTS_PER_SPEAKER]
+        selected = learnable_segments(transcript_segments, speaker_id)
+        if not selected:
+            log.debug("No learnable speech for speaker %s (%s)", speaker_id, name)
+            continue
 
         channel = channel_map.get(speaker_id, "system")
         channel_data = _extract_channel_audio(audio_path, channel)
@@ -806,6 +837,22 @@ def update_profiles_from_confirmed_labels(
     if not confirmed_label_map:
         return
 
+    # Only clusters with enough real speech are learned from (see
+    # learnable_segments); decide before loading the model.
+    selections = {
+        sid: learnable_segments(transcript_segments, sid)
+        for sid in confirmed_label_map
+    }
+    for sid, name in confirmed_label_map.items():
+        if not selections[sid]:
+            log.info(
+                "Not learning '%s' from %s: under %.0fs of dense speech "
+                "(fillers / echo / silence would pollute the profile)",
+                name, sid, LEARN_MIN_SPEECH_SECONDS,
+            )
+    if not any(selections.values()):
+        return
+
     try:
         inference = _get_inference()
     except Exception as exc:
@@ -816,16 +863,9 @@ def update_profiles_from_confirmed_labels(
     updated = []
 
     for speaker_id, name in confirmed_label_map.items():
-        segs = [
-            (seg.start, seg.end)
-            for seg in transcript_segments
-            if seg.speaker == speaker_id and (seg.end - seg.start) >= MIN_SEGMENT_DURATION
-        ]
-        if not segs:
+        selected = selections[speaker_id]
+        if not selected:
             continue
-
-        segs.sort(key=lambda s: s[1] - s[0], reverse=True)
-        selected = segs[:MAX_SEGMENTS_PER_SPEAKER]
 
         channel = channel_map.get(speaker_id, "system")
         channel_data = _extract_channel_audio(audio_path, channel)

@@ -479,11 +479,29 @@ def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backe
             )
         click.echo()
 
+    # A ghost REMOTE bucket (filler crosstalk from several people) wins over
+    # any voiceprint match: there is no single voice in it to match.  Worse,
+    # its stretched-filler segments are mostly room tone and the scribe's own
+    # voice echoing back through the call, so a profile that once learned
+    # them (vezir 2026-09: "Pattern", ~0.86 to the scribe's echo) matches
+    # every such bucket at ~0.9 and keeps it out of CROSSTALK.  Replay data:
+    # 1 in 120 ghost-shaped buckets was ever one real person.
+    ghost_ids: set[str] = set()
+    if auto and transcript is not None:
+        from millet.label import crosstalk_label_map
+
+        ghost_ids = set(crosstalk_label_map(transcript, set()))
+        for spk_id in sorted(ghost_ids & set(auto_matches)):
+            click.echo(
+                f"  Ignoring voiceprint match {spk_id} -> "
+                f"{auto_matches[spk_id].name} (filler crosstalk, not one voice)."
+            )
+
     # Separate speakers into auto-matched (applicable) and unrecognized.
     # Weak matches count as unrecognized so they stay raw.
     applied_matches = {
         spk_id: m for spk_id, m in auto_matches.items()
-        if spk_id not in weak_matches
+        if spk_id not in weak_matches and spk_id not in ghost_ids
     }
     unrecognized = [sp for sp in speakers if sp.id not in applied_matches]
 

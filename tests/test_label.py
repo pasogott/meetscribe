@@ -1056,6 +1056,22 @@ class TestLabelAutoCrosstalk:
         assert ids == {"SPEAKER_00", "SPEAKER_01", CROSSTALK}
         upd.assert_not_called()
 
+    def test_ghost_wins_over_a_strong_voiceprint_match(self, tmp_path):
+        # The "Pattern" incident: a polluted profile matched the filler
+        # bucket at ~0.9, naming it after a person and keeping it out of
+        # CROSSTALK.  A ghost bucket has no single voice to match.
+        sdir = self._session(tmp_path)
+        data, upd, out = self._run(
+            sdir, {"SPEAKER_00": "Kemal", "SPEAKER_01": "Lukas", "REMOTE": "Pattern"},
+        )
+        ids = {sp["id"] for sp in data["speakers"]}
+        assert ids == {"Kemal", "Lukas", CROSSTALK}
+        assert "Ignoring voiceprint match REMOTE -> Pattern" in out
+        # Nor is it offered as an auto-id suggestion to the labeling UI.
+        sidecar = json.loads((sdir / f"{sdir.name}.autoid.json").read_text())
+        assert "Pattern" not in {v["name"] for v in sidecar["suggestions"].values()}
+        upd.assert_not_called()
+
 
 # ─── millet label --apply-json (non-interactive embedder mode) ──────────────
 
