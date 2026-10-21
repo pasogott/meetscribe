@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "millet-pipeline"
-version = "0.21.6"
+version = "0.21.7"
 description = "Meeting transcription pipeline (diarization, AI summaries, PDF output) under the vezir ecosystem.  Builds on millet-record for capture.  Named after the Ottoman millet system.  Successor to meetscribe-offline."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -56,7 +56,12 @@ dependencies = [
     # huggingface_hub; listed explicitly because millet/__init__.py
     # imports it directly for the F3 SSL_CERT_FILE injection (see
     # the M8 retrospective).
-    "certifi",
+    # Floor added in 0.21.7: certifi < 2026.10.19 still trusts the eight
+    # eMudhra intermediates whose private keys leaked (2026-10-20,
+    # emudhra.we-have-a-problem.com).  Because of that SSL_CERT_FILE
+    # injection, certifi is the trust store not just for requests/HF but
+    # for every subprocess millet spawns -- including `git push` in sync.
+    "certifi>=2026.10.19",
 ]
 
 # `millet` console script is provided by millet-record; the pipeline

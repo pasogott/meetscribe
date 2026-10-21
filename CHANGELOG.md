@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.21.7 — distrust the leaked eMudhra intermediates
+
+The private keys of eight eMudhra intermediate CAs were found to be
+recoverable from their certificates (disclosed 2026-10-20,
+<https://emudhra.we-have-a-problem.com/>).  Browsers block them; bundled
+trust stores need an update.
+
+### Security
+
+- Requires `certifi>=2026.10.19`, the first release that drops them.  The
+  dependency was unpinned.  It matters more for millet than for most
+  packages: `millet/__init__.py` sets `SSL_CERT_FILE` to certifi's bundle
+  when it is unset, so certifi is the trust store for requests,
+  Hugging Face downloads, urllib, *and* every subprocess millet spawns
+  (`git push` in `millet sync`) — the patched system `ca-certificates` is
+  bypassed.
+- Existing installs: `pip install -U 'certifi>=2026.10.19'` in millet's
+  environment fixes it without upgrading millet.  Verify with Python +
+  `certifi.where()` against `https://dv-g3b-emudhra.we-have-a-problem.com/`
+  — it must fail with a certificate error.
+
+No code change.
+
 ## v0.21.6 — TEE default → DeepSeek V4.1 Flash (Tinfoil deprecates GLM-5.3 Flash)
 
 Tinfoil announced on 2026-10-06 that `glm-5-3-flash` — the default summary
