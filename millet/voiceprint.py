@@ -254,6 +254,9 @@ def save_profiles(
         profiles_path: Explicit path.  When ``None``, falls back to
             :func:`_default_profiles_path`.
     """
+    import os
+    import tempfile
+
     p = profiles_path or _default_profiles_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     data = {
@@ -263,9 +266,30 @@ def save_profiles(
         }
         for name, prof in profiles.items()
     }
-    p.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
+    # Atomic replace (audit L-8).  The profile DB is a running average with
+    # no provenance, and vezir SIGKILLs the whole millet process group on a
+    # watchdog timeout — a plain write_text() interrupted mid-way left a
+    # truncated, unrecoverable team voiceprint DB.  Write to a sibling temp
+    # file (0600, same filesystem), fsync, then rename over the target.
+    fd, tmp = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if p.exists():
+            try:
+                os.chmod(tmp, p.stat().st_mode & 0o777)
+            except OSError:
+                pass
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _merge_embedding(

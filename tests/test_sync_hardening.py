@@ -310,3 +310,20 @@ def test_run_network_gates_on_remote_host_not_github(monkeypatch, tmp_path):
             retries=1, delay=0,
         )
     assert looked_up == ["gitlab.example.org"]
+
+
+# ─── L-7: transcript.json must not carry the server's absolute audio path ────
+
+
+def test_transcript_json_stores_audio_basename_only(tmp_path):
+    from millet.transcribe import Transcript
+
+    t = Transcript(
+        audio_file="/home/op/vezir-data/sessions/01ULID/01ULID.wav",
+        language="en", duration=1.0, speakers=[], segments=[],
+    )
+    data = json.loads(t.to_json())
+    assert data["audio_file"] == "01ULID.wav"
+    assert "/home/" not in t.to_json()
+    # Readers only ever derive stem/date from it; the round-trip keeps that.
+    assert Path(data["audio_file"]).stem == "01ULID"

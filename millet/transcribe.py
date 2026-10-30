@@ -768,7 +768,11 @@ class Transcript:
     def to_json(self) -> str:
         """JSON output with full detail."""
         data = {
-            "audio_file": self.audio_file,
+            # Name only, never the absolute path: this JSON is pushed to the
+            # team repo as transcript.json and leaked the server's
+            # /home/<user>/vezir-data/sessions/<id>/ layout (audit L-7).
+            # Every reader uses Path(audio_file).stem or the filename date.
+            "audio_file": Path(self.audio_file).name if self.audio_file else "",
             "language": self.language,
             "duration": self.duration,
             "speakers": [{"id": s.id, "label": s.label} for s in self.speakers],
