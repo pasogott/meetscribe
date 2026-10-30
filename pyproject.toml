@@ -40,6 +40,8 @@ classifiers = [
 dependencies = [
     "millet-record>=0.4.0",
     "whisperx>=3.8",
+    "transformers<5",
+    "huggingface-hub<1",
     "click>=8.0",
     "reportlab>=4.0",
     "requests>=2.28",

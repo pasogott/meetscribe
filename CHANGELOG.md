@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Dependencies
+
+- Guard WhisperX deployments with `transformers<5` and `huggingface-hub<1`.
+  Torch and Transformers remain on the latest WhisperX-compatible versions;
+  no downgrade is required.
+
 ### Security
 
 - `millet sync` rejects a symlinked sync root that escapes the clone before
