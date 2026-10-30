@@ -313,10 +313,8 @@ def test_git_env_never_prompts(monkeypatch):
 
 def test_https_clone_without_credentials_fails_fast_not_hangs(tmp_path, monkeypatch):
     """A credential prompt used to hang until vezir's 15-min watchdog fired."""
-    import socket
     import time
 
-    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [])
     monkeypatch.delenv("GIT_TERMINAL_PROMPT", raising=False)
     # A loopback URL nothing listens on: fails at connect, never at a prompt.
     t0 = time.monotonic()
@@ -329,55 +327,49 @@ def test_https_clone_without_credentials_fails_fast_not_hangs(tmp_path, monkeypa
 
 
 def test_run_network_bounds_hanging_dns(monkeypatch, tmp_path):
-    import socket
-    import threading
+    import sys
     import time
 
-    started = threading.Event()
-    release = threading.Event()
-
-    def hanging_gai(*args, **kwargs):
-        started.set()
-        release.wait(5)
-        return []
+    started = []
 
     def failed_run(cmd, **kwargs):
+        if cmd[0] == sys.executable:
+            started.append(cmd)
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
         return subprocess.CompletedProcess(cmd, 1, "", "network unavailable")
 
-    monkeypatch.setattr(socket, "getaddrinfo", hanging_gai)
-    monkeypatch.setattr(subprocess, "run", failed_run)
+    monkeypatch.setattr(sync.subprocess, "run", failed_run)
     monkeypatch.setattr(sync, "_DNS_TIMEOUT", 0.02)
     t0 = time.monotonic()
-    try:
-        with pytest.raises(RuntimeError, match="network unavailable"):
-            sync._run_network(
-                [
-                    "git",
-                    "clone",
-                    "--",
-                    "https://gitlab.example.org/o/r.git",
-                    str(tmp_path / "c"),
-                ],
-                retries=1,
-                delay=0,
-            )
-    finally:
-        release.set()
+    with pytest.raises(RuntimeError, match="network unavailable"):
+        sync._run_network(
+            [
+                "git",
+                "clone",
+                "--",
+                "https://gitlab.example.org/o/r.git",
+                str(tmp_path / "c"),
+            ],
+            retries=1,
+            delay=0,
+        )
 
-    assert started.is_set()
+    assert started
     assert time.monotonic() - t0 < 1
 
 
 def test_run_network_gates_on_remote_host_not_github(monkeypatch, tmp_path):
-    import socket
+    import sys
 
     looked_up: list[str] = []
 
-    def fake_gai(host, *a, **k):
-        looked_up.append(host)
-        return []
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == sys.executable:
+            looked_up.append(cmd[-2])
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return subprocess.CompletedProcess(cmd, 1, "", "no repository")
 
-    monkeypatch.setattr(socket, "getaddrinfo", fake_gai)
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
     with pytest.raises(RuntimeError):
         sync._run_network(
             ["git", "clone", "--", "https://gitlab.example.org/o/r.git", str(tmp_path / "c")],

@@ -386,31 +386,30 @@ _NETWORK_GIT_TIMEOUT = 600
 _DNS_TIMEOUT = 10.0
 
 
-def _getaddrinfo_with_timeout(host: str, port: int) -> Any:
-    import queue
-    import socket
-    import threading
+def _getaddrinfo_with_timeout(host: str, port: int) -> None:
+    """Resolve in a child that subprocess.run kills on timeout."""
+    import sys
 
-    result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def lookup() -> None:
-        try:
-            result.put((True, socket.getaddrinfo(host, port)))
-        except Exception as exc:
-            result.put((False, exc))
-
-    threading.Thread(
-        target=lookup, name=f"millet-dns-{host}", daemon=True
-    ).start()
     try:
-        succeeded, value = result.get(timeout=_DNS_TIMEOUT)
-    except queue.Empty as exc:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import socket,sys; socket.getaddrinfo(sys.argv[1], int(sys.argv[2]))",
+                host,
+                str(port),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_DNS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
         raise TimeoutError(
             f"DNS resolution for {host} timed out after {_DNS_TIMEOUT}s"
         ) from exc
-    if succeeded:
-        return value
-    raise value
+    if result.returncode:
+        raise RuntimeError(f"DNS resolution for {host} failed: {result.stderr[:200]}")
 
 
 def _ssh_with_batch_mode(command: str) -> str:
