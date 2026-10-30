@@ -163,6 +163,36 @@ def test_assert_inside_rejects_escape(tmp_path):
         sync._assert_inside(tmp_path / "repo-sibling", root, "bad")
 
 
+def test_sync_session_rejects_cloned_sync_root_symlink(
+    monkeypatch, tmp_path, git_identity
+):
+    bare = tmp_path / "escape.git"
+    seed = tmp_path / "escape-seed"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _git("init", "--bare", "--initial-branch=main", str(bare))
+    _git("clone", str(bare), str(seed))
+    (seed / "meetings").symlink_to(outside)
+    _git("add", "meetings", cwd=seed)
+    _git("commit", "-m", "malicious sync root", cwd=seed)
+    _git("push", "origin", "HEAD:main", cwd=seed)
+    _configure(monkeypatch, tmp_path, str(bare))
+    sdir = _session_with_meta(
+        tmp_path,
+        "meeting-20260706-100000",
+        {"started_at": "2026-07-06T10:00:00+00:00", "session_id": "01TESTULID"},
+    )
+
+    with pytest.raises(RuntimeError, match="sync root outside the sync repo"):
+        sync.sync_session(
+            sdir,
+            sync.MeetingMatch(name="Weekly", folder="weekly"),
+            progress_callback=lambda m: None,
+        )
+
+    assert list(outside.iterdir()) == []
+
+
 def test_sync_session_with_crafted_session_json_writes_nothing_outside(
     monkeypatch, tmp_path, local_remote
 ):
@@ -269,12 +299,16 @@ def test_git_env_never_prompts(monkeypatch):
     env = sync._git_env()
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert "BatchMode=yes" in env["GIT_SSH_COMMAND"]
-    # Operator overrides win.
-    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /custom/key")
+
+    monkeypatch.setenv(
+        "GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /custom/key"
+    )
     monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
     env = sync._git_env()
-    assert env["GIT_SSH_COMMAND"] == "ssh -i /custom/key"
-    assert env["GIT_TERMINAL_PROMPT"] == "1"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert "BatchMode=no" not in env["GIT_SSH_COMMAND"]
+    assert "-i /custom/key" in env["GIT_SSH_COMMAND"]
+    assert env["GIT_SSH_COMMAND"].endswith("-o BatchMode=yes")
 
 
 def test_https_clone_without_credentials_fails_fast_not_hangs(tmp_path, monkeypatch):
@@ -292,6 +326,46 @@ def test_https_clone_without_credentials_fails_fast_not_hangs(tmp_path, monkeypa
             retries=1, delay=0,
         )
     assert time.monotonic() - t0 < 30
+
+
+def test_run_network_bounds_hanging_dns(monkeypatch, tmp_path):
+    import socket
+    import threading
+    import time
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def hanging_gai(*args, **kwargs):
+        started.set()
+        release.wait(5)
+        return []
+
+    def failed_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, "", "network unavailable")
+
+    monkeypatch.setattr(socket, "getaddrinfo", hanging_gai)
+    monkeypatch.setattr(subprocess, "run", failed_run)
+    monkeypatch.setattr(sync, "_DNS_TIMEOUT", 0.02)
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="network unavailable"):
+            sync._run_network(
+                [
+                    "git",
+                    "clone",
+                    "--",
+                    "https://gitlab.example.org/o/r.git",
+                    str(tmp_path / "c"),
+                ],
+                retries=1,
+                delay=0,
+            )
+    finally:
+        release.set()
+
+    assert started.is_set()
+    assert time.monotonic() - t0 < 1
 
 
 def test_run_network_gates_on_remote_host_not_github(monkeypatch, tmp_path):

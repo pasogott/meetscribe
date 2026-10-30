@@ -383,22 +383,78 @@ def _host_from_url(url: str) -> str | None:
 # that takes longer than ten minutes is a stuck transfer, not a slow one.
 _LOCAL_GIT_TIMEOUT = 120
 _NETWORK_GIT_TIMEOUT = 600
+_DNS_TIMEOUT = 10.0
+
+
+def _getaddrinfo_with_timeout(host: str, port: int) -> Any:
+    import queue
+    import socket
+    import threading
+
+    result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def lookup() -> None:
+        try:
+            result.put((True, socket.getaddrinfo(host, port)))
+        except Exception as exc:
+            result.put((False, exc))
+
+    threading.Thread(
+        target=lookup, name=f"millet-dns-{host}", daemon=True
+    ).start()
+    try:
+        succeeded, value = result.get(timeout=_DNS_TIMEOUT)
+    except queue.Empty as exc:
+        raise TimeoutError(
+            f"DNS resolution for {host} timed out after {_DNS_TIMEOUT}s"
+        ) from exc
+    if succeeded:
+        return value
+    raise value
+
+
+def _ssh_with_batch_mode(command: str) -> str:
+    import shlex
+
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return f"{command} -o BatchMode=yes"
+
+    filtered: list[str] = []
+    removed = False
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if part == "-o" and i + 1 < len(parts):
+            option = parts[i + 1]
+            if re.match(r"^batchmode(?:\s|=|$)", option, flags=re.IGNORECASE):
+                removed = True
+                i += 2
+                continue
+        elif part.lower().startswith("-obatchmode"):
+            removed = True
+            i += 1
+            continue
+        filtered.append(part)
+        i += 1
+
+    if not removed:
+        return f"{command} -o BatchMode=yes"
+    return shlex.join([*filtered, "-o", "BatchMode=yes"])
 
 
 def _git_env() -> dict[str, str]:
-    """Environment for git subprocesses: never prompt, never hang on a prompt.
-
-    ``GIT_TERMINAL_PROMPT=0`` makes git fail instead of asking for HTTPS
-    credentials; ``BatchMode=yes`` does the same for ssh.  Both are only
-    *defaulted* so an operator's own ``GIT_SSH_COMMAND`` / askpass setup
-    still wins.
-    """
+    """Environment for git subprocesses with prompting forcibly disabled."""
     import os
+    import shlex
 
     env = dict(os.environ)
-    env.setdefault("GIT_TERMINAL_PROMPT", "0")
-    if "GIT_SSH_COMMAND" not in env and "GIT_SSH" not in env:
-        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    command = env.get("GIT_SSH_COMMAND") or env.get("GIT_SSH") or "ssh"
+    if "GIT_SSH_COMMAND" not in env and "GIT_SSH" in env:
+        command = shlex.quote(command)
+    env["GIT_SSH_COMMAND"] = _ssh_with_batch_mode(command)
     return env
 
 
@@ -637,9 +693,9 @@ def _run_network(
         if host:
             for _ in range(retries):
                 try:
-                    socket.getaddrinfo(host, 443)
+                    _getaddrinfo_with_timeout(host, 443)
                     break
-                except socket.gaierror:
+                except (socket.gaierror, TimeoutError):
                     log.debug("DNS for %s not resolving, waiting %.0fs", host, delay)
                     time.sleep(delay)
             else:
@@ -1024,6 +1080,8 @@ def sync_session(
     repo = ensure_repo_cloned(progress_callback=progress_callback, team=team)
 
     subdir = _meetings_subdir(team)
+    sync_root = repo / subdir
+    _assert_inside(sync_root, repo, "sync root")
     date_str = _date_from_session(session_dir)
     session_id = _session_id_for(session_dir)
     # Each meeting gets its own folder: date first so folders sort chronologically.
@@ -1036,13 +1094,13 @@ def sync_session(
     # Containment is asserted BEFORE the first write.  Every component above
     # is validated, but this is the one check that holds regardless of how
     # the inputs were produced (audit M-5).
-    _assert_inside(target_dir, repo / subdir, "meeting folder")
+    _assert_inside(target_dir, sync_root, "meeting folder")
     target_dir.mkdir(parents=True, exist_ok=True)
     if session_id:
         (target_dir / SESSION_ID_MARKER).write_text(session_id + "\n", encoding="utf-8")
 
     # Ensure README exists
-    _ensure_readme(repo / subdir, team=team)
+    _ensure_readme(sync_root, team=team)
 
     # Collect and copy files with descriptive names
     source_files = _collect_files(session_dir)
@@ -1061,7 +1119,7 @@ def sync_session(
 
     # Also stage the README
     _run(
-        ["git", "add", str((repo / subdir / "README.md").relative_to(repo))],
+        ["git", "add", str((sync_root / "README.md").relative_to(repo))],
         cwd=repo,
     )
 
