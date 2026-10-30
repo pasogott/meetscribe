@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- `millet sync` rejects a symlinked sync root that escapes the clone before
+  any meeting write, forces Git/SSH prompting off despite inherited settings,
+  and bounds DNS resolution as well as Git network commands.
+- Correct NEAR provenance to `(response-signed, provider-key)`: response
+  signatures verify under a self-consistent provider-supplied key, but that key
+  is not bound to a verified TDX quote.  Enclave-origin claims are removed;
+  full quote/channel binding remains open.
+
 ## v0.22.0 — attestation that is actually verified (audit M-2 follow-up)
 
 ### Security
