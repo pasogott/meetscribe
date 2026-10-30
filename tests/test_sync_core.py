@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from millet import sync
+from tests.conftest import _git  # local-git helper shared with test_sync_hardening
 
 # ─── _redact ─────────────────────────────────────────────────────────────────
 
@@ -285,7 +286,10 @@ def test_pull_failure_aborts_rebase(monkeypatch, tmp_path):
 
     def fake_run(cmd, cwd=None, check=True):
         run_calls.append(list(cmd))
-        return real_completed(cmd, 0, stdout="", stderr="")
+        # The clone-reuse origin guard (audit H-3) asks git for the remote;
+        # answer with the configured one so this test stays about the rebase.
+        out = "https://x/r.git\n" if cmd[:3] == ["git", "remote", "get-url"] else ""
+        return real_completed(cmd, 0, stdout=out, stderr="")
 
     def fake_run_network(cmd, cwd=None, **kw):
         raise RuntimeError("rebase conflict")
@@ -303,36 +307,6 @@ def test_pull_failure_aborts_rebase(monkeypatch, tmp_path):
 
 
 # ─── sync_session end-to-end (local git) ────────────────────────────────────
-
-
-def _git(*args: str, cwd: Path | None = None) -> None:
-    subprocess.run(
-        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
-    )
-
-
-@pytest.fixture
-def git_identity(monkeypatch):
-    monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
-    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
-    monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
-    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.com")
-    # Never pick up the developer's git config / credential helpers.
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-
-
-@pytest.fixture
-def local_remote(tmp_path, git_identity):
-    """A seeded local bare repo usable as a sync target."""
-    bare = tmp_path / "remote.git"
-    _git("init", "--bare", "--initial-branch=main", str(bare))
-    seed = tmp_path / "seed"
-    _git("clone", str(bare), str(seed))
-    (seed / "README.md").write_text("seed\n")
-    _git("add", ".", cwd=seed)
-    _git("commit", "-m", "init", cwd=seed)
-    _git("push", "origin", "HEAD:main", cwd=seed)
-    return bare
 
 
 def _make_session(tmp_path: Path, name: str, session_id: str) -> Path:

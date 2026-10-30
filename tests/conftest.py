@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import wave
 from pathlib import Path
 
@@ -200,3 +201,36 @@ A test meeting with three participants discussing the agenda and budget.
     )
 
     return sdir
+
+
+# ─── Local git remote (shared by test_sync_core / test_sync_hardening) ──────
+
+
+def _git(*args: str, cwd: Path | None = None) -> None:
+    subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    )
+
+
+@pytest.fixture
+def git_identity(monkeypatch):
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.com")
+    # Never pick up the developer's git config / credential helpers.
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+@pytest.fixture
+def local_remote(tmp_path, git_identity):
+    """A seeded local bare repo usable as a sync target."""
+    bare = tmp_path / "remote.git"
+    _git("init", "--bare", "--initial-branch=main", str(bare))
+    seed = tmp_path / "seed"
+    _git("clone", str(bare), str(seed))
+    (seed / "README.md").write_text("seed\n")
+    _git("add", ".", cwd=seed)
+    _git("commit", "-m", "init", cwd=seed)
+    _git("push", "origin", "HEAD:main", cwd=seed)
+    return bare

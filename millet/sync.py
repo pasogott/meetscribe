@@ -86,23 +86,56 @@ MEETINGS_SUBDIR = "meetings"
 SESSION_ID_MARKER = ".session-id"
 
 
+# A session id becomes part of a repo path (``<date>_<folder>-<id[-6:]>``).
+# ``*.session.json`` is user-supplied on vezir's import path, so the value
+# must be a single safe path component — never ``..``, a separator, or a
+# control character (security audit 2026-10-30, M-5).
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _safe_session_id(value: object) -> str | None:
+    """Return ``value`` if it is a safe single path component, else None."""
+    if not isinstance(value, str):
+        return None
+    sid = value.strip()
+    if not sid or sid in (".", "..") or not _SESSION_ID_RE.match(sid):
+        return None
+    return sid
+
+
 def _session_id_for(session_dir: Path) -> str | None:
     """Best-effort session id for a session directory.
 
     Prefers ``session_id`` from ``*.session.json`` (vezir injects it), then
-    falls back to the directory name (a bare ULID for vezir sessions).
+    falls back to the directory name (a bare ULID for vezir sessions).  A
+    value that is not a safe single path component is ignored, not used.
     """
     sj = _find_session_json(session_dir)
     if sj is not None:
         try:
             data = json.loads(sj.read_text(encoding="utf-8"))
-            sid = (data.get("session_id") or "").strip()
+            sid = _safe_session_id(data.get("session_id"))
             if sid:
                 return sid
+            if data.get("session_id"):
+                log.warning(
+                    "%s: ignoring unsafe session_id %r", sj.name, data.get("session_id")
+                )
         except Exception:
             pass
-    name = session_dir.name
-    return name or None
+    return _safe_session_id(session_dir.name)
+
+
+def _assert_inside(path: Path, root: Path, what: str) -> None:
+    """Raise unless ``path`` resolves to ``root`` or somewhere beneath it.
+
+    Called before every mkdir/copy into the clone so a crafted date, session
+    id, or attachment name can never write outside the repository.
+    """
+    r = root.resolve()
+    p = path.resolve()
+    if p != r and r not in p.parents:
+        raise RuntimeError(f"refusing to write {what} outside the sync repo: {p}")
 
 
 def _resolve_target_dir(base_dir: Path, session_id: str | None, log_fn) -> Path:
@@ -254,6 +287,30 @@ def is_sync_configured(
     return bool(config.get("repo_url"))
 
 
+def _normalize_remote(url: str) -> str:
+    """Canonical form for comparing two git remote URLs.
+
+    Case-folds, drops a trailing ``/`` and ``.git``, strips ``user:token@``
+    credentials (a credential-helper rewrite must not look like a different
+    remote), and maps scp-style ``git@host:org/repo`` to ``ssh://git@host/org/repo``.
+    """
+    u = (url or "").strip()
+    m = re.match(r"^([A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+):(?!//)(.+)$", u)
+    if m:
+        u = f"ssh://{m.group(1)}/{m.group(2)}"
+    u = re.sub(r"^([a-z][a-z0-9+.-]*://)[^@/]+@", r"\1", u, flags=re.IGNORECASE)
+    u = u.rstrip("/")
+    if u.lower().endswith(".git"):
+        u = u[:-4]
+    return u.rstrip("/").lower()
+
+
+def _same_remote(actual: str, configured: str) -> bool:
+    """True when two remote URLs denote the same repository."""
+    a, c = _normalize_remote(actual), _normalize_remote(configured)
+    return bool(a) and a == c
+
+
 def _repo_name_from_url(repo_url: str) -> str:
     """Extract a safe directory name from a Git URL.
 
@@ -277,8 +334,10 @@ def _repo_name_from_url(repo_url: str) -> str:
 # local/NFS bare repos and in tests).  Anything else — notably git's
 # option-capable / arbitrary-command transports like ``ext::sh -c ...`` — is
 # rejected, as is a repo_url that git would parse as an option (leading '-').
+# ``git://`` dropped in 0.21.8 (audit L-11): unauthenticated and unencrypted,
+# retired by GitHub in 2022 — no legitimate sync target needs it.
 _ALLOWED_REPO_URL_RE = re.compile(
-    r"^(?:https://|ssh://|git://|file://|/|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:)",
+    r"^(?:https://|ssh://|file://|/|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:)",
 )
 
 
@@ -293,12 +352,54 @@ def _validate_repo_url(repo_url: str) -> None:
         raise RuntimeError(
             f"Refusing repo_url that looks like a git option: {_redact(repo_url)!r}"
         )
+    if any(ord(ch) < 0x20 or ch.isspace() for ch in repo_url):
+        raise RuntimeError(
+            f"Refusing repo_url with whitespace/control characters: {_redact(repo_url)!r}"
+        )
     if not _ALLOWED_REPO_URL_RE.match(repo_url):
         raise RuntimeError(
-            "Unsupported repo_url scheme. Use https://, ssh://, git://, "
-            "file://, an absolute path, or scp-style user@host:path — got: "
+            "Unsupported repo_url scheme. Use https://, ssh://, file://, an "
+            "absolute path, or scp-style user@host:path — got: "
             f"{_redact(repo_url)!r}"
         )
+
+
+def _host_from_url(url: str) -> str | None:
+    """Best-effort remote host for the DNS gate; None for local paths."""
+    u = (url or "").strip()
+    m = re.match(r"^[a-z][a-z0-9+.-]*://(?:[^@/]+@)?([^/:]+)", u, flags=re.IGNORECASE)
+    if m:
+        host = m.group(1)
+        return None if host in ("", "localhost") or u.lower().startswith("file://") else host
+    m = re.match(r"^[A-Za-z0-9._-]+@([A-Za-z0-9._-]+):", u)
+    if m:
+        return m.group(1)
+    return None
+
+
+# Timeouts (audit L-11).  Neither helper had one, so a credential prompt or a
+# stalled transfer hung until the vezir worker's 15-minute watchdog killed the
+# whole job.  Local git ops are fast; a clone/pull/push of a meetings repo
+# that takes longer than ten minutes is a stuck transfer, not a slow one.
+_LOCAL_GIT_TIMEOUT = 120
+_NETWORK_GIT_TIMEOUT = 600
+
+
+def _git_env() -> dict[str, str]:
+    """Environment for git subprocesses: never prompt, never hang on a prompt.
+
+    ``GIT_TERMINAL_PROMPT=0`` makes git fail instead of asking for HTTPS
+    credentials; ``BatchMode=yes`` does the same for ssh.  Both are only
+    *defaulted* so an operator's own ``GIT_SSH_COMMAND`` / askpass setup
+    still wins.
+    """
+    import os
+
+    env = dict(os.environ)
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    if "GIT_SSH_COMMAND" not in env and "GIT_SSH" not in env:
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    return env
 
 
 # ─── Schedule matching ────────────────────────────────────────────────────────
@@ -468,7 +569,15 @@ def _run(
     cmd: list[str], cwd: Path | None = None, check: bool = True
 ) -> subprocess.CompletedProcess:
     """Run a command, raising on non-zero exit if check=True."""
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True,
+            timeout=_LOCAL_GIT_TIMEOUT, env=_git_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            _redact(f"Command timed out after {_LOCAL_GIT_TIMEOUT}s: {' '.join(cmd)}")
+        ) from exc
     if check and result.returncode != 0:
         # _redact: never leak repo_url credentials into exception text
         # (which the vezir worker captures into job logs).
@@ -504,21 +613,47 @@ def _run_network(
     import socket
     import time
 
+    # Gate on the remote's actual host (audit L-11: this used to be hard-coded
+    # to github.com, so non-GitHub remotes got no gate and GitHub outages
+    # gated unrelated remotes).  Clone carries the URL in argv; pull/push
+    # ask the clone for its origin.  Local/unknown remotes skip the gate.
+    host: str | None = None
+    url_arg = next((a for a in cmd[2:] if "://" in a or re.match(r"^[^/]+@[^/]+:", a)), None)
+    if url_arg:
+        host = _host_from_url(url_arg)
+    elif cwd is not None:
+        try:
+            origin = subprocess.run(
+                ["git", "remote", "get-url", "origin"], cwd=cwd,
+                capture_output=True, text=True, timeout=_LOCAL_GIT_TIMEOUT,
+            ).stdout.strip()
+            host = _host_from_url(origin)
+        except Exception:
+            host = None
+
     last_result: subprocess.CompletedProcess | None = None
     for attempt in range(1, retries + 1):
         # Gate on DNS: wait until the git host resolves before burning a try.
-        host = "github.com"  # default; could be parsed from cmd
-        for _ in range(retries):
-            try:
-                socket.getaddrinfo(host, 443)
-                break
-            except socket.gaierror:
-                log.debug("DNS for %s not resolving, waiting %.0fs", host, delay)
-                time.sleep(delay)
-        else:
-            log.warning("DNS for %s did not resolve after %d waits", host, retries)
+        if host:
+            for _ in range(retries):
+                try:
+                    socket.getaddrinfo(host, 443)
+                    break
+                except socket.gaierror:
+                    log.debug("DNS for %s not resolving, waiting %.0fs", host, delay)
+                    time.sleep(delay)
+            else:
+                log.warning("DNS for %s did not resolve after %d waits", host, retries)
 
-        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(
+                cmd, cwd=cwd, capture_output=True, text=True,
+                timeout=_NETWORK_GIT_TIMEOUT, env=_git_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                _redact(f"Command timed out after {_NETWORK_GIT_TIMEOUT}s: {' '.join(cmd)}")
+            ) from exc
         if result.returncode == 0:
             return result
         last_result = result
@@ -640,6 +775,23 @@ def ensure_repo_cloned(progress_callback=None, team: str | None = None) -> Path:
         # New clone: register the local-only ignore for collision markers.
         _ensure_local_gitignore(clone_dir)
     else:
+        # The clone must belong to THIS remote.  Clone dirs are keyed by repo
+        # basename (per team when --team is given), so ``orgA/meetings`` and
+        # ``orgB/meetings`` — or an old and a new remote with the same name —
+        # would otherwise share one clone and push each other's meetings to
+        # the wrong repository (security audit 2026-10-30, H-3).  Refuse
+        # rather than re-clone: a clone with the wrong origin may hold
+        # unpushed commits an operator wants to inspect.
+        actual = _run(
+            ["git", "remote", "get-url", "origin"], cwd=clone_dir, check=False
+        ).stdout.strip()
+        if not _same_remote(actual, repo_url):
+            raise RuntimeError(
+                f"Sync clone at {clone_dir} points at {_redact(actual) or '<none>'}, "
+                f"not the configured {_redact(repo_url)}.  Move or delete the "
+                "clone (or pass --team so each team gets its own) before syncing."
+            )
+
         # Keep the local-only collision markers out of git's sight so they
         # neither get committed nor trip the uncommitted-changes guard.
         _ensure_local_gitignore(clone_dir)
@@ -780,16 +932,20 @@ def _date_from_session(session_dir: Path) -> str:
         d = parts[1]
         return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
 
-    # Fallback: read from session.json
+    # Fallback: read from session.json.  Parse, don't slice: the file is
+    # user-supplied on vezir's import path and the value feeds a repo path
+    # (``../../../x`` is also ten characters — audit M-5).
     sj = _find_session_json(session_dir)
     if sj:
         try:
             meta = json.loads(sj.read_text(encoding="utf-8"))
-            started = meta.get("started_at", "")[:10]
-            if len(started) == 10:
-                return started
+            started = meta.get("started_at")
+            if isinstance(started, str) and started.strip():
+                return datetime.fromisoformat(
+                    started.strip().replace("Z", "+00:00")
+                ).strftime("%Y-%m-%d")
         except Exception:
-            pass
+            log.warning("%s: ignoring unparseable started_at", sj.name)
 
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -877,6 +1033,10 @@ def sync_session(
     # one schedule window) from clobbering each other.
     base_dir = repo / subdir / f"{date_str}_{meeting_type.folder}"
     target_dir = _resolve_target_dir(base_dir, session_id, _log)
+    # Containment is asserted BEFORE the first write.  Every component above
+    # is validated, but this is the one check that holds regardless of how
+    # the inputs were produced (audit M-5).
+    _assert_inside(target_dir, repo / subdir, "meeting folder")
     target_dir.mkdir(parents=True, exist_ok=True)
     if session_id:
         (target_dir / SESSION_ID_MARKER).write_text(session_id + "\n", encoding="utf-8")
@@ -893,6 +1053,7 @@ def sync_session(
     for src, dest_name in source_files:
         dest = target_dir / dest_name
         # dest_name carries an "attachments/" prefix for attached files.
+        _assert_inside(dest, target_dir, f"artifact {dest_name!r}")
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
         copied.append(dest)
