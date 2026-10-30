@@ -20,10 +20,14 @@ import millet.summarize as sm
 
 class TestRegistry:
     def test_fallback_order_and_backends(self):
-        assert sm.DEFAULT_FALLBACK_ORDER == ("tinfoil", "venice", "near", "ollama")
+        # 0.21.8 (audit M-2): venice/near stay registered + usable, but are
+        # no longer in the default chain — their attestation is not bound to
+        # the transport, so reaching them requires an explicit opt-in.
+        assert sm.DEFAULT_FALLBACK_ORDER == ("tinfoil", "ollama")
         for b in ("venice", "near"):
             assert b in sm.BACKENDS
             assert b in sm.ATTESTED_BACKENDS
+            assert b not in sm.DEFAULT_FALLBACK_ORDER
 
     def test_default_models(self):
         # Real ids verified live 2026-09-15: Venice attested models need the
@@ -47,6 +51,9 @@ class TestVisionGating:
 
         # Every backend "available"; make tinfoil (primary) fail so the loop
         # walks the fallback order and we can see which tiers it skips.
+        # Opt the unbound tiers in explicitly so the gating is exercised on
+        # the full chain (they are not in the default order since 0.21.8).
+        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "tinfoil,venice,near,ollama")
         monkeypatch.setattr(sm, "is_backend_available", lambda cfg: True)
 
         def _dispatch(backend, *a, **k):

@@ -4,9 +4,16 @@ Every supported backend keeps meeting content private:
   - tinfoil: Hardware-attested TEE inference (requires TINFOIL_API_KEY).
              Prompts are encrypted into the enclave; neither the model
              provider nor the cloud operator can read them.  Default.
-  - venice / near: Decorrelated hardware-attested TEE fallbacks (Intel
-             TDX + NVIDIA H100/H200 Confidential Computing; millet verifies
-             each enclave's NRAS attestation + freshness nonce itself).
+  - venice / near: OPT-IN OpenAI-compatible TEE providers (Intel TDX +
+             NVIDIA Confidential Computing).  millet checks each enclave's
+             NRAS GPU evidence + a freshness nonce, but that attestation is
+             NOT bound to the TLS peer that receives the prompt (Venice's
+             gateway terminates TLS outside the enclave; no cert/signing-key
+             binding is implemented for either), and the NRAS EAT signature
+             is not verified.  So "attested" here means "the provider owns a
+             CC-GPU that saw our nonce" — not "nobody but the enclave can
+             read the transcript".  Since 0.21.8 they are therefore OUT of
+             the default chain and never badged like Tinfoil.
   - ollama:  Local Ollama server (free, fully local, never leaves the box).
 
 The non-private cloud backends (claudemax, openrouter, openai) were removed
@@ -15,12 +22,17 @@ precision and recall across EN/DE/TR, so routing meeting content through
 a provider that can read it no longer bought anything -- see
 docs/tee-summarization-evaluation.md.
 
-Fallback chain: tinfoil -> venice -> near -> ollama (DEFAULT_FALLBACK_ORDER,
-overridable via MILLET_SUMMARY_FALLBACK_ORDER).  Every destination is
-private — three attested TEEs plus the local box — so the chain can never
-leak content to a third party; it can only trade quality, and it always
-says so (fallback_used + backend/model in the summary meta sidecar; a local
-fallback is recorded as ollama/<model>, never labelled a TEE).
+Fallback chain: tinfoil -> ollama (DEFAULT_FALLBACK_ORDER, overridable via
+MILLET_SUMMARY_FALLBACK_ORDER).  Both destinations are private — an
+attested TEE whose transport the SDK binds to the enclave, or the local
+box — so the default chain can never leak content to a third party; it can
+only trade quality, and it always says so (fallback_used + backend/model in
+the summary meta sidecar; a local fallback is recorded as ollama/<model>,
+never labelled a TEE).  venice/near were in the default chain from 0.21.0
+to 0.21.7 (security audit 2026-10-30, M-2): with a provider key present and
+a transient Tinfoil outage, meeting content went to a party whose
+transport is not proven to end inside the enclave, while the sidecar still
+said "TEE".  Operators who accept that trust model opt in explicitly.
 
 Since 0.21.2 an explicitly requested preset follows the same chain.  The
 preset names are pure aliases of the default (0.19.0), so pinning them to
@@ -113,14 +125,19 @@ def _resolve_api_key(env_var: str, key_file: Path) -> str | None:
     return None
 
 
-# ─── Attested OpenAI-compatible fallback backends (venice, near) ────────────
+# ─── Opt-in OpenAI-compatible TEE backends (venice, near) ──────────────────
 #
 # Decorrelated TEE providers so Tinfoil is not a single point of failure.
 # Both speak the OpenAI API, so one generic path (_summarize_attested_oai)
-# drives them; they differ only in this table.  Before a summary from one is
-# badged "attested", millet.attestation.verify_attestation checks the
-# enclave's NVIDIA NRAS evidence + our freshness nonce itself (see that
-# module for the deliberate ceiling on full TDX-quote validation).
+# drives them; they differ only in this table.  Before a prompt is sent,
+# millet.attestation.verify_attestation checks the enclave's NVIDIA NRAS
+# evidence + our freshness nonce.  That is a weaker guarantee than Tinfoil's
+# SDK, which pins the TLS session to the attested enclave: here nothing ties
+# the attested GPU to the HTTPS peer that receives the transcript, and the
+# NRAS EAT signature is not verified (see millet.attestation for the
+# deliberate ceiling).  Hence: opt-in only (not in DEFAULT_FALLBACK_ORDER),
+# and the recorded model carries a "(TEE, transport unbound)" suffix so no
+# downstream badge mistakes it for a Tinfoil-grade attestation.
 #
 #   base_url        OpenAI-compatible endpoint
 #   key_env/file    API key (env var, then 0600 key file — Tinfoil pattern)
@@ -368,12 +385,15 @@ RETIRED_BACKENDS = ("claudemax", "openrouter", "openai")
 _WARNED_BACKENDS: set[str] = set()
 _WARNED_MODELS: set[str] = set()
 
-# Fallback order.  Every destination is private, so the chain cannot silently
-# downgrade confidentiality the way the old claudemax/openrouter chain could.
-# tinfoil (attested, vision) -> venice (attested, vision) -> near (attested,
-# text) -> ollama (local, text).  Vision-gating (see _dispatch) keeps a frames
-# job off the text-only tiers rather than silently dropping the images.
-DEFAULT_FALLBACK_ORDER = ("tinfoil", "venice", "near", "ollama")
+# Fallback order.  Both destinations are private, so the chain cannot
+# silently downgrade confidentiality the way the old claudemax/openrouter
+# chain could: tinfoil (attested + transport-bound, vision) -> ollama (local,
+# text).  Vision-gating (see _dispatch) keeps a frames job off the text-only
+# tier rather than silently dropping the images.  venice/near are deliberately
+# NOT here (0.21.8, audit M-2): their attestation is not bound to the transport,
+# so they must be opted into via MILLET_SUMMARY_FALLBACK_ORDER or
+# --summary-backend by an operator who has read the trade-off above.
+DEFAULT_FALLBACK_ORDER = ("tinfoil", "ollama")
 # Backward-compatible alias for the historical default order.
 FALLBACK_ORDER = DEFAULT_FALLBACK_ORDER
 
@@ -1710,13 +1730,16 @@ def _summarize_attested_oai(
     user_prompt: str,
     config: SummaryConfig,
 ) -> MeetingSummary:
-    """Summarize via an OpenAI-compatible attested TEE backend (venice/near).
+    """Summarize via an opt-in OpenAI-compatible TEE backend (venice/near).
 
     Verifies the enclave's attestation (NVIDIA NRAS evidence + freshness nonce)
-    *before* sending any prompt, so meeting content only leaves the box once the
-    hardware is confirmed.  A failed attestation raises AttestationError and is
-    treated by summarize() like the Tinfoil attestation fault: fall through to
-    the next backend, never save an unverified result as attested.
+    *before* sending any prompt.  That proves the provider operates a CC-GPU
+    that saw our nonce; it does NOT prove the HTTPS peer receiving the prompt
+    is that enclave (no transport binding — see the ATTESTED_BACKENDS comment),
+    which is why these backends are opt-in and recorded as "transport unbound".
+    A failed attestation raises AttestationError and is treated by summarize()
+    like the Tinfoil attestation fault: fall through to the next backend, never
+    save an unverified result.
 
     Transient network errors are retried with the same budget/backoff as the
     Tinfoil path; genuine auth/model errors fail fast.
@@ -1813,9 +1836,12 @@ def _summarize_attested_oai(
     if not content_out:
         raise RuntimeError(f"{backend} returned an empty response for model {model!r}.")
 
+    # Not "(TEE)" like the Tinfoil path: the SDK there binds the TLS session
+    # to the attested enclave; here the attestation is a separate document
+    # with no link to the HTTPS peer.  Say so in the recorded provenance.
     return MeetingSummary(
         markdown=content_out,
-        model=f"{model} (TEE)",
+        model=f"{model} (TEE, transport unbound)",
         elapsed_seconds=elapsed,
         backend=backend,
         fallback_used=False,

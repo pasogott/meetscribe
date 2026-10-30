@@ -138,17 +138,24 @@ class TestResolveFallbackOrder:
         monkeypatch.delenv("MILLET_SUMMARY_FALLBACK_ORDER", raising=False)
         order = _resolve_fallback_order()
         assert order == DEFAULT_FALLBACK_ORDER
-        assert order == ("tinfoil", "venice", "near", "ollama")
+        assert order == ("tinfoil", "ollama")
 
-    def test_every_destination_is_private(self):
-        """The chain must not be able to downgrade confidentiality.
+    def test_every_default_destination_is_transport_bound_or_local(self):
+        """The default chain must not be able to downgrade confidentiality.
 
-        tinfoil/venice/near are attested TEEs, ollama is local — all private.
+        tinfoil's SDK binds the TLS session to the attested enclave; ollama
+        never leaves the box.  venice/near verify an attestation document
+        that is NOT bound to the HTTPS peer, so they are opt-in only
+        (security audit 2026-10-30, M-2).
         """
-        assert all(
-            b in ("tinfoil", "venice", "near", "ollama")
-            for b in DEFAULT_FALLBACK_ORDER
-        )
+        assert set(DEFAULT_FALLBACK_ORDER) <= {"tinfoil", "ollama"}
+        assert "venice" not in DEFAULT_FALLBACK_ORDER
+        assert "near" not in DEFAULT_FALLBACK_ORDER
+
+    def test_unbound_tee_backends_are_opt_in(self, monkeypatch):
+        """An operator who accepts the weaker trust model can still chain them."""
+        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "tinfoil,venice,near,ollama")
+        assert _resolve_fallback_order() == ("tinfoil", "venice", "near", "ollama")
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "ollama,tinfoil")
@@ -230,12 +237,36 @@ class TestPresetFallback:
         assert result.fallback_used is True
         assert result.preset == preset  # the ask is preserved in provenance
 
-    def test_requested_preset_falls_back_to_attested_tier(self, monkeypatch):
-        """A decorrelated TEE is preferred over local when available —
-        quality-first ordering, privacy identical."""
+    def test_venice_key_present_does_not_reroute_by_default(self, monkeypatch):
+        """Regression for audit M-2: a provider key on the box + a Tinfoil
+        outage must NOT silently send the transcript to venice/near.  With
+        the default chain the job lands on local ollama; with ollama also
+        unavailable it fails loud rather than using the unbound tier."""
+        monkeypatch.delenv("MILLET_SUMMARY_FALLBACK_ORDER", raising=False)
         _patch_backends(
             monkeypatch,
-            available={"tinfoil", "venice"},
+            available={"tinfoil", "venice", "near", "ollama"},
+            failing={"tinfoil"},
+        )
+        result = summarize("transcript text", SummaryConfig(preset="confidential"))
+        assert result.backend == "ollama"
+        assert result.fallback_used is True
+
+        _patch_backends(
+            monkeypatch,
+            available={"tinfoil", "venice", "near"},
+            failing={"tinfoil"},
+        )
+        with pytest.raises(RuntimeError):
+            summarize("transcript text", SummaryConfig(preset="confidential"))
+
+    def test_unbound_tier_reachable_only_by_explicit_opt_in(self, monkeypatch):
+        """Opting in via MILLET_SUMMARY_FALLBACK_ORDER restores the 0.21.0
+        behaviour, and the fallback is recorded as such."""
+        monkeypatch.setenv("MILLET_SUMMARY_FALLBACK_ORDER", "tinfoil,venice,ollama")
+        _patch_backends(
+            monkeypatch,
+            available={"tinfoil", "venice", "ollama"},
             failing={"tinfoil"},
         )
         result = summarize("transcript text", SummaryConfig(preset="confidential"))
@@ -252,9 +283,9 @@ class TestPresetFallback:
     def test_unavailable_primary_chains_instead_of_raising(self, monkeypatch):
         """No tinfoil key at all: the chain skips it (with the reason kept
         for the all-skipped error) rather than hard-failing the preset."""
-        _patch_backends(monkeypatch, available={"venice"}, failing=set())
+        _patch_backends(monkeypatch, available={"ollama"}, failing=set())
         result = summarize("transcript text", SummaryConfig(preset="confidential"))
-        assert result.backend == "venice"
+        assert result.backend == "ollama"
 
     def test_all_private_backends_failing_still_fails_loud(self, monkeypatch):
         _patch_backends(

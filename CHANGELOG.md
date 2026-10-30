@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.21.8 — security audit 2026-10-30 (sync hardening, honest attestation)
+
+Fixes from a full security review of millet and vezir.  No new features.
+
+### Security
+
+- **venice / near are out of the default summary chain.**
+  `DEFAULT_FALLBACK_ORDER` is `tinfoil → ollama` again.  From 0.21.0 to
+  0.21.7 it was `tinfoil → venice → near → ollama`: with a `VENICE_API_KEY`
+  / `NEAR_AI_API_KEY` on the box and a transient Tinfoil outage, the
+  transcript went to a provider whose transport is not proven to end
+  inside the enclave — millet checks the NVIDIA NRAS GPU evidence and a
+  freshness nonce, but nothing binds that attestation to the HTTPS peer
+  that receives the prompt (Venice's own config notes its gateway
+  terminates TLS outside the TEE), and the NRAS EAT signature is not
+  verified.  The sidecar still said "TEE".  Both backends stay registered
+  and usable, but only by explicit opt-in
+  (`MILLET_SUMMARY_FALLBACK_ORDER=tinfoil,venice,near,ollama` or
+  `--summary-backend`), and their recorded model now reads
+  `<model> (TEE, transport unbound)` instead of `<model> (TEE)` so no
+  downstream badge treats them as Tinfoil-grade.  Full channel binding
+  and NRAS signature verification are tracked as follow-ups.
+
 ## v0.21.7 — distrust the leaked eMudhra intermediates
 
 The private keys of eight eMudhra intermediate CAs were found to be
