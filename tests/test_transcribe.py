@@ -902,10 +902,17 @@ class TestDualChannelDispatch:
 
     def test_mono_mixdown_does_not_dispatch_to_dual_channel(self, stereo_wav):
         """Stereo audio with mixdown='mono' should NOT call _transcribe_dual_channel."""
-        with patch("millet.transcribe._transcribe_dual_channel") as mock_dual:
+        with (
+            patch("millet.transcribe._transcribe_dual_channel") as mock_dual,
+            patch(
+                "millet.transcribe._mixdown_to_mono",
+                side_effect=RuntimeError("reached mono path"),
+            ) as mock_mono,
+        ):
             config = TranscriptionConfig(mixdown="mono")
-            with pytest.raises(Exception):
+            with pytest.raises(RuntimeError, match="reached mono path"):
                 do_transcribe(str(stereo_wav), config)
+            mock_mono.assert_called_once_with(stereo_wav)
             mock_dual.assert_not_called()
 
 
