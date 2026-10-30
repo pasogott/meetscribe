@@ -122,15 +122,43 @@ class TestAttestationVerifier:
 
         return _R()
 
+    # A fake NRAS with a real P-384 key: since 0.22.0 the EAT signature is
+    # verified against NVIDIA's JWKS (alg pinned ES384, issuer pinned, exp
+    # required), so the fake must look exactly like the real thing.
     @staticmethod
-    def _nras_resp(nonce, overall=True):
+    def _nras_keypair():
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        if not hasattr(TestAttestationVerifier, "_kp"):
+            TestAttestationVerifier._kp = ec.generate_private_key(ec.SECP384R1())
+        return TestAttestationVerifier._kp
+
+    @classmethod
+    def _jwks_doc(cls, kid="nv-eat-kid-test"):
         import jwt as pyjwt
 
-        eat = pyjwt.encode(
-            {"iss": "https://nras.attestation.nvidia.com",
-             "x-nvidia-overall-att-result": overall, "eat_nonce": nonce},
-            "s",
-        )
+        pub = cls._nras_keypair().public_key()
+        jwk = pyjwt.algorithms.ECAlgorithm.to_jwk(pub, as_dict=True)
+        jwk["kid"] = kid
+        return {"keys": [jwk]}
+
+    @classmethod
+    def _eat(cls, nonce, overall=True, *, alg="ES384", kid="nv-eat-kid-test",
+             iss="https://nras.attestation.nvidia.com", key=None, exp_delta=3600):
+        import time
+
+        import jwt as pyjwt
+
+        claims = {"iss": iss, "x-nvidia-overall-att-result": overall, "eat_nonce": nonce,
+                  "iat": int(time.time()), "exp": int(time.time()) + exp_delta}
+        if alg.startswith("HS"):
+            return pyjwt.encode(claims, "s", algorithm=alg, headers={"kid": kid})
+        return pyjwt.encode(claims, key or cls._nras_keypair(), algorithm=alg,
+                            headers={"kid": kid})
+
+    @classmethod
+    def _nras_resp(cls, nonce, overall=True, **eat_kw):
+        eat = cls._eat(nonce, overall, **eat_kw)
 
         class _R:
             status_code = 200
@@ -141,27 +169,74 @@ class TestAttestationVerifier:
 
         return _R()
 
+    @classmethod
+    def _wire(cls, monkeypatch, doc, nonce, overall=True, **eat_kw):
+        """requests.get serves the attestation doc AND the JWKS; post = NRAS."""
+        jwks = cls._jwks_doc()
+
+        def _get(url, *a, **k):
+            if "jwks" in url:
+                return cls._get_resp(jwks)
+            return cls._get_resp(doc)
+
+        monkeypatch.setattr(att.requests, "get", _get)
+        monkeypatch.setattr(att.requests, "post",
+                            lambda *a, **k: cls._nras_resp(nonce, overall, **eat_kw))
+        monkeypatch.setattr(att, "_JWKS_CACHE", {})
+        monkeypatch.setattr(att, "_JWKS_FETCHED_AT", 0.0)
+
     def test_accepted(self, monkeypatch):
         doc = {"model_attestations": [{"nvidia_payload": {"e": 1}}], "nonce": "abc123"}
-        monkeypatch.setattr(att.requests, "get", lambda *a, **k: self._get_resp(doc))
-        monkeypatch.setattr(att.requests, "post",
-                            lambda *a, **k: self._nras_resp("abc123", overall=True))
+        self._wire(monkeypatch, doc, "abc123", overall=True)
         att.verify_attestation("https://x/att", api_key="k", nonce="abc123")  # no raise
 
     def test_nonce_mismatch_rejected(self, monkeypatch):
         doc = {"nvidia_payload": {"e": 1}}
-        monkeypatch.setattr(att.requests, "get", lambda *a, **k: self._get_resp(doc))
-        monkeypatch.setattr(att.requests, "post",
-                            lambda *a, **k: self._nras_resp("DIFFERENT", overall=True))
+        self._wire(monkeypatch, doc, "DIFFERENT", overall=True)
         with pytest.raises(att.AttestationError, match="nonce"):
             att.verify_attestation("https://x/att", api_key="k", nonce="abc123")
 
     def test_overall_fail_rejected(self, monkeypatch):
         doc = {"nvidia_payload": {"e": 1}}
-        monkeypatch.setattr(att.requests, "get", lambda *a, **k: self._get_resp(doc))
-        monkeypatch.setattr(att.requests, "post",
-                            lambda *a, **k: self._nras_resp("abc123", overall=False))
+        self._wire(monkeypatch, doc, "abc123", overall=False)
         with pytest.raises(att.AttestationError, match="overall result"):
+            att.verify_attestation("https://x/att", api_key="k", nonce="abc123")
+
+    # ── 0.22.0 (audit M-2): the EAT signature is actually verified ──────────
+
+    def test_eat_signed_by_wrong_key_rejected(self, monkeypatch):
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        doc = {"nvidia_payload": {"e": 1}}
+        other = ec.generate_private_key(ec.SECP384R1())
+        self._wire(monkeypatch, doc, "abc123", key=other)
+        with pytest.raises(att.AttestationError, match="signature/claims rejected"):
+            att.verify_attestation("https://x/att", api_key="k", nonce="abc123")
+
+    def test_eat_with_hs256_rejected(self, monkeypatch):
+        """Before 0.22.0 an HS256 token with ANY secret was accepted
+        (verify_signature=False).  Alg is pinned now."""
+        doc = {"nvidia_payload": {"e": 1}}
+        self._wire(monkeypatch, doc, "abc123", alg="HS256")
+        with pytest.raises(att.AttestationError, match="unexpected alg"):
+            att.verify_attestation("https://x/att", api_key="k", nonce="abc123")
+
+    def test_eat_unknown_kid_rejected(self, monkeypatch):
+        doc = {"nvidia_payload": {"e": 1}}
+        self._wire(monkeypatch, doc, "abc123", kid="nv-eat-kid-unknown")
+        with pytest.raises(att.AttestationError, match="not in NVIDIA JWKS"):
+            att.verify_attestation("https://x/att", api_key="k", nonce="abc123")
+
+    def test_eat_wrong_issuer_rejected(self, monkeypatch):
+        doc = {"nvidia_payload": {"e": 1}}
+        self._wire(monkeypatch, doc, "abc123", iss="https://nras.attestation.nvidia.com.evil")
+        with pytest.raises(att.AttestationError):
+            att.verify_attestation("https://x/att", api_key="k", nonce="abc123")
+
+    def test_eat_expired_rejected(self, monkeypatch):
+        doc = {"nvidia_payload": {"e": 1}}
+        self._wire(monkeypatch, doc, "abc123", exp_delta=-10)
+        with pytest.raises(att.AttestationError, match="signature/claims rejected"):
             att.verify_attestation("https://x/att", api_key="k", nonce="abc123")
 
     def test_no_payload_rejected(self, monkeypatch):
@@ -198,9 +273,11 @@ class TestBillingClassification:
 
         class _Client:
             def __init__(self, **k):
-                self.chat = types.SimpleNamespace(
-                    completions=types.SimpleNamespace(create=self._create)
+                completions = types.SimpleNamespace(
+                    create=self._create,
+                    with_raw_response=types.SimpleNamespace(create=self._create),
                 )
+                self.chat = types.SimpleNamespace(completions=completions)
 
             def _create(self, **k):
                 raise Exception("Error code: 402 - Insufficient USD or Diem balance")
@@ -211,3 +288,175 @@ class TestBillingClassification:
         cfg = sm.SummaryConfig(backend="venice", model="e2ee-glm-5-3-flash")
         with pytest.raises(RuntimeError, match="billing"):
             sm._summarize_attested_oai("venice", "sys", "user", cfg)
+
+
+# ── 0.22.0 (audit M-2): NEAR per-response signature binding ─────────────────
+
+
+def _secp_keypair():
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    priv = ec.generate_private_key(ec.SECP256K1())
+    nums = priv.public_key().public_numbers()
+    pub_hex = f"{nums.x:064x}{nums.y:064x}"
+    return priv, pub_hex
+
+
+def _eip191_sign(priv, text: str) -> str:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import (
+        Prehashed,
+        decode_dss_signature,
+    )
+
+    from millet.keccak import keccak256
+
+    msg = text.encode()
+    digest = keccak256(b"\x19Ethereum Signed Message:\n" + str(len(msg)).encode() + msg)
+    der = priv.sign(digest, ec.ECDSA(Prehashed(hashes.SHA256())))
+    r, s_ = decode_dss_signature(der)
+    return "0x" + r.to_bytes(32, "big").hex() + s_.to_bytes(32, "big").hex() + "1b"
+
+
+class TestResponseSignature:
+    def _wire_sig(self, monkeypatch, doc):
+        monkeypatch.setattr(att.requests, "get", lambda *a, **k: TestAttestationVerifier._get_resp(doc))
+
+    def test_keccak_known_answers(self):
+        from millet.keccak import keccak256
+
+        assert keccak256(b"").hex().startswith("c5d2460186f7233c")
+        # NOT sha3_256 (different padding).
+        import hashlib
+
+        assert keccak256(b"abc") != hashlib.sha3_256(b"abc").digest()
+
+    def test_signing_key_extracted_and_checked(self):
+        from millet.keccak import keccak256
+
+        _priv, pub = _secp_keypair()
+        addr = keccak256(bytes.fromhex(pub))[-20:].hex()
+        doc = {"model_attestations": [{
+            "signing_address": "0x" + addr, "signing_public_key": pub, "request_nonce": "ab",
+        }]}
+        out = att._signing_key_from_doc(doc, "AB")
+        assert out == {"signing_address": addr, "signing_public_key": pub}
+        bad = {"model_attestations": [{
+            "signing_address": "0x" + "0" * 40, "signing_public_key": pub, "request_nonce": "ab",
+        }]}
+        with pytest.raises(att.AttestationError, match="does not match"):
+            att._signing_key_from_doc(bad, "ab")
+        with pytest.raises(att.AttestationError, match="nonce"):
+            att._signing_key_from_doc(doc, "other")
+        assert att._signing_key_from_doc({"nvidia_payload": "x"}, "ab") is None  # venice shape
+
+    def test_valid_signature_verifies(self, monkeypatch):
+        import hashlib
+
+        priv, pub = _secp_keypair()
+        req, resp = b'{"model":"m","messages":[]}', b'{"id":"c1","choices":[]}'
+        text = f"m:{hashlib.sha256(req).hexdigest()}:{hashlib.sha256(resp).hexdigest()}"
+        from millet.keccak import keccak256
+
+        self._wire_sig(monkeypatch, {
+            "text": text, "signature": _eip191_sign(priv, text),
+            "signing_address": "0x" + keccak256(bytes.fromhex(pub))[-20:].hex(),
+        })
+        att.verify_response_signature(
+            "https://x/sig/c1", api_key="k", model="m",
+            request_bytes=req, response_bytes=resp, signing_public_key=pub,
+        )
+
+    @pytest.mark.parametrize("tamper", ["request", "response", "model", "key", "sig"])
+    def test_tampering_is_detected(self, monkeypatch, tamper):
+        import hashlib
+
+        priv, pub = _secp_keypair()
+        req, resp = b'{"model":"m"}', b'{"id":"c1"}'
+        text = f"m:{hashlib.sha256(req).hexdigest()}:{hashlib.sha256(resp).hexdigest()}"
+        sig = _eip191_sign(priv, text)
+        check_req, check_resp, check_model, check_pub = req, resp, "m", pub
+        if tamper == "request":
+            check_req = req + b" "
+        elif tamper == "response":
+            check_resp = resp + b" "
+        elif tamper == "model":
+            check_model = "other"
+        elif tamper == "key":
+            _, check_pub = _secp_keypair()
+        elif tamper == "sig":
+            sig = sig[:-4] + ("0000" if sig[-4:] != "0000" else "1111")
+        self._wire_sig(monkeypatch, {"text": text, "signature": sig})
+        with pytest.raises(att.AttestationError):
+            att.verify_response_signature(
+                "https://x/sig/c1", api_key="k", model=check_model,
+                request_bytes=check_req, response_bytes=check_resp,
+                signing_public_key=check_pub,
+            )
+
+    def test_near_path_labels_response_signed_and_fails_closed(self, monkeypatch):
+        """End-to-end through _summarize_attested_oai with a fake OpenAI
+        client: a verified signature yields the response-signed label; a
+        bad one raises AttestationError (→ fallback loop, never saved)."""
+        import hashlib
+        import sys
+        import types
+
+        priv, pub = _secp_keypair()
+        from millet.keccak import keccak256
+
+        addr = keccak256(bytes.fromhex(pub))[-20:].hex()
+        req_bytes = b'{"model":"z-ai/glm-5.3-flash","messages":[]}'
+        resp_bytes = b'{"id":"chat-1","choices":[{"message":{"content":"# Summary"}}]}'
+        good_text = (
+            f"z-ai/glm-5.3-flash:{hashlib.sha256(req_bytes).hexdigest()}:"
+            f"{hashlib.sha256(resp_bytes).hexdigest()}"
+        )
+        state = {"sig_text": good_text}
+
+        monkeypatch.setattr(sm, "_resolve_attested_api_key", lambda b: "k")
+        monkeypatch.setattr(sm, "verify_model", lambda *a, **k: None)
+        monkeypatch.setattr(
+            att, "verify_attestation",
+            lambda *a, **k: {"signing_address": addr, "signing_public_key": pub},
+        )
+
+        def _get(url, *a, **k):
+            assert url.endswith("/v1/signature/chat-1")
+            return TestAttestationVerifier._get_resp({
+                "text": state["sig_text"], "signature": _eip191_sign(priv, state["sig_text"]),
+                "signing_address": "0x" + addr,
+            })
+
+        monkeypatch.setattr(att.requests, "get", _get)
+
+        mod = types.ModuleType("openai")
+
+        class _Raw:
+            http_response = types.SimpleNamespace(
+                request=types.SimpleNamespace(content=req_bytes), content=resp_bytes,
+            )
+
+            def parse(self):
+                return types.SimpleNamespace(
+                    id="chat-1",
+                    choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="# Summary"))],
+                )
+
+        class _Client:
+            def __init__(self, **k):
+                self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(
+                    with_raw_response=types.SimpleNamespace(create=lambda **kw: _Raw()),
+                ))
+
+        mod.OpenAI = _Client
+        monkeypatch.setitem(sys.modules, "openai", mod)
+
+        cfg = sm.SummaryConfig(backend="near", model="z-ai/glm-5.3-flash")
+        out = sm._summarize_attested_oai("near", "sys", "user", cfg)
+        assert out.model == "z-ai/glm-5.3-flash (TEE, response-signed)"
+
+        state["sig_text"] = good_text[:-1] + ("0" if good_text[-1] != "0" else "1")
+        with pytest.raises(att.AttestationError):
+            sm._summarize_attested_oai("near", "sys", "user", cfg)

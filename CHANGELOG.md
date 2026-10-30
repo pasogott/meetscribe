@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.22.0 — attestation that is actually verified (audit M-2 follow-up)
+
+### Security
+
+- **NVIDIA NRAS EATs are signature-verified.**  `millet.attestation`
+  decoded the Entity Attestation Token with `verify_signature=False`, so
+  the "GPU is genuine and in a good state" verdict rested on the TLS
+  session to nvidia.com alone.  The EAT is now verified against NVIDIA's
+  published JWKS (`/.well-known/jwks.json`, cached, one re-fetch on an
+  unknown `kid`), algorithm pinned to ES384, issuer pinned, `exp`
+  required.  Applies to both venice and near.
+- **NEAR responses are bound to the attested enclave.**  NEAR signs every
+  completion — `"<model>:<sha256(request)>:<sha256(response)>"`, EIP-191
+  secp256k1 — with the model enclave's key, the same key the attestation
+  report ties into the TDX `report_data` (`signing_address ==
+  keccak256(pubkey)[-20:]`, checked).  millet now sends the request via
+  the SDK's raw-response path, fetches `/v1/signature/{id}`, recomputes
+  both hashes from the exact bytes sent and received, and verifies the
+  signature with the attested public key.  A mismatch raises
+  `AttestationError` (fallback loop, never saved).  Verified live
+  2026-10-30.  The provenance reads `<model> (TEE, response-signed)`.
+  This proves origin and integrity of the output; it still does not
+  prove the gateway's TLS termination point cannot read the request, so
+  NEAR remains opt-in and short of Tinfoil's `(TEE)`.  Venice keeps
+  `(TEE, transport unbound)` — it offers no per-response signature.
+- New `millet/keccak.py`: pure-Python Keccak-256 (Ethereum padding, not
+  `sha3_256`), known-answer-checked on import, for the two checks above.
+
+### Tests
+
+- 14 new in `tests/test_attested_fallback.py`: the fake NRAS now signs
+  with a real P-384 key and serves a JWKS; wrong key / HS256 / unknown
+  kid / wrong issuer / expired all rejected; keccak KATs; signing-key
+  extraction + address check; valid signature verifies; request /
+  response / model / key / signature tampering each detected; end-to-end
+  NEAR path yields the response-signed label and fails closed.
+
 ## v0.21.8 — security audit 2026-10-30 (sync hardening, honest attestation)
 
 Fixes from a full security review of millet and vezir.  No new features.

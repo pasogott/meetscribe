@@ -173,6 +173,10 @@ ATTESTED_BACKENDS: dict[str, dict[str, object]] = {
             "https://cloud-api.near.ai/v1/attestation/report?model={model}&signing_algo=ecdsa"
         ),
         "catalog_url": "https://cloud-api.near.ai/v1/models",
+        # Per-response signature by the model enclave key (verified live
+        # 2026-10-30): text = "<model>:<sha256(req)>:<sha256(resp)>", EIP-191
+        # secp256k1, signing_address == the attestation report's.
+        "signature_url": "https://cloud-api.near.ai/v1/signature/{chat_id}",
         "confidentiality": "tee-terminated-tls",  # direct-completions terminate TLS in the TEE
     },
 }
@@ -1746,7 +1750,12 @@ def _summarize_attested_oai(
     """
     import time
 
-    from millet.attestation import AttestationError, new_nonce, verify_attestation
+    from millet.attestation import (
+        AttestationError,
+        new_nonce,
+        verify_attestation,
+        verify_response_signature,
+    )
 
     cfg = ATTESTED_BACKENDS[backend]
     api_key = _resolve_attested_api_key(backend)
@@ -1770,7 +1779,15 @@ def _summarize_attested_oai(
     # is loud and non-silent (AttestationError propagates to the fallback loop).
     nonce = new_nonce()
     attestation_url = str(cfg["attestation_url"]).format(model=model)
-    verify_attestation(attestation_url, api_key=api_key, nonce=nonce)
+    signing_key = verify_attestation(attestation_url, api_key=api_key, nonce=nonce)
+    signature_url_tpl = cfg.get("signature_url")
+    if signature_url_tpl and not signing_key:
+        # The provider documents per-response signatures but this report
+        # carried no key for the model: never fall back to unsigned.
+        raise AttestationError(
+            f"{backend}: attestation report carries no signing key for {model!r}; "
+            "cannot verify response signatures"
+        )
 
     if frames:
         content, frames_sent = _encode_frames_content(user_prompt, frames)
@@ -1799,7 +1816,9 @@ def _summarize_attested_oai(
     while True:
         attempt += 1
         try:
-            response = client.chat.completions.create(
+            # with_raw_response: we need the exact bytes sent and received to
+            # check the enclave's per-response signature (audit M-2).
+            raw = client.chat.completions.with_raw_response.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -1808,6 +1827,8 @@ def _summarize_attested_oai(
                 temperature=config.temperature,
                 timeout=config.timeout,
             )
+            response = raw.parse()
+            http_response = raw.http_response
             break
         except AttestationError:
             raise
@@ -1836,12 +1857,34 @@ def _summarize_attested_oai(
     if not content_out:
         raise RuntimeError(f"{backend} returned an empty response for model {model!r}.")
 
-    # Not "(TEE)" like the Tinfoil path: the SDK there binds the TLS session
-    # to the attested enclave; here the attestation is a separate document
-    # with no link to the HTTPS peer.  Say so in the recorded provenance.
+    # Response-origin binding (0.22.0, audit M-2): NEAR signs
+    # "<model>:<sha256(request)>:<sha256(response)>" with the model enclave's
+    # key, which the attestation report tied into the TDX report_data.  A
+    # verified signature proves the bytes we hold were produced inside the
+    # attested enclave for the bytes we sent.  It does NOT prove the
+    # gateway's TLS termination point cannot read the request, so the
+    # label stays short of Tinfoil's "(TEE)".
+    if signature_url_tpl and signing_key:
+        chat_id = getattr(response, "id", None)
+        if not chat_id:
+            raise AttestationError(f"{backend} response carries no id; cannot verify signature")
+        verify_response_signature(
+            str(signature_url_tpl).format(chat_id=chat_id),
+            api_key=api_key,
+            model=model,
+            request_bytes=http_response.request.content,
+            response_bytes=http_response.content,
+            signing_public_key=signing_key["signing_public_key"],
+        )
+        label = f"{model} (TEE, response-signed)"
+    else:
+        # No per-response signature on this provider: the attestation is a
+        # separate document with no link to the HTTPS peer.  Say so.
+        label = f"{model} (TEE, transport unbound)"
+
     return MeetingSummary(
         markdown=content_out,
-        model=f"{model} (TEE, transport unbound)",
+        model=label,
         elapsed_seconds=elapsed,
         backend=backend,
         fallback_used=False,
