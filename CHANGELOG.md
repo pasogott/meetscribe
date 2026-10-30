@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.22.1 — security audit validation follow-up
 
 ### Dependencies
 
@@ -17,6 +17,12 @@
   signatures verify under a self-consistent provider-supplied key, but that key
   is not bound to a verified TDX quote.  Enclave-origin claims are removed;
   full quote/channel binding remains open.
+
+### Tests
+
+- Full local suite: **689 passed, 1 skipped**.  The mono dispatch regression no
+  longer depends on local GPU/model setup; the full suite runs without the
+  previous mono-mixdown deselection.
 
 ## v0.22.0 — attestation that is actually verified (audit M-2 follow-up)
 
