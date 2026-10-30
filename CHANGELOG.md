@@ -22,6 +22,61 @@ Fixes from a full security review of millet and vezir.  No new features.
   `<model> (TEE, transport unbound)` instead of `<model> (TEE)` so no
   downstream badge treats them as Tinfoil-grade.  Full channel binding
   and NRAS signature verification are tracked as follow-ups.
+- **`millet sync` refuses a clone whose `origin` is not the configured
+  remote.**  Clone directories are keyed by repository basename (per team
+  only when `--team` is given), so `orgA/meetings.git` and
+  `orgB/meetings.git` — or an old and a new remote with the same name —
+  silently shared one clone and pushed each other's meetings to the wrong
+  repository.  `ensure_repo_cloned` now compares `git remote get-url
+  origin` with `repo_url` (credential-, case- and `.git`-insensitive;
+  scp-style and `ssh://` forms are treated as equal) and raises on
+  mismatch rather than re-cloning, since a clone with the wrong origin may
+  hold unpushed commits an operator wants to inspect.
+- **`*.session.json` can no longer steer the sync target path.**  The file
+  is user-supplied on vezir's import path.  `started_at` was sliced
+  (`[:10]`, `len == 10`) and `session_id` used raw as a folder suffix, so
+  `../../../x` placed the meeting folder outside the clone and files were
+  copied before `relative_to()` failed.  `started_at` is parsed with
+  `datetime.fromisoformat`, `session_id` must be a single safe path
+  component (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, else the directory name
+  is used), and containment of the target folder and of every artifact is
+  asserted before any `mkdir`/copy.
+- **Frontmatter emitter quotes control characters.**  `_NEEDS_QUOTING`
+  did not match newlines, so a participant name (`Alice\n---\n# x` via the
+  label map), a session title, or any LLM-emitted topic/decision/action
+  line closed the YAML block early or injected list items/keys into the
+  synced `summary.md`.  All C0/C1 controls and the Unicode line/paragraph
+  separators now force double-quoting with proper escapes; the fallback
+  parser gets a single-pass decoder (the chained `.replace()` turned an
+  escaped backslash + `n` into a newline).
+- **`transcript.json` carries the audio basename, not the absolute path**,
+  which leaked the server's `/home/<user>/vezir-data/sessions/<id>/`
+  layout into every synced meeting.
+- **git runs non-interactively with bounded timeouts** in `millet sync`:
+  `GIT_TERMINAL_PROMPT=0` and `ssh -o BatchMode=yes` are defaulted (an
+  operator's own `GIT_SSH_COMMAND`/`GIT_SSH` wins), local git ops time
+  out at 120 s and clone/pull/push at 600 s, so a credential prompt or a
+  stalled transfer fails fast instead of hanging until vezir's 15-minute
+  watchdog kills the job.  The DNS gate now resolves the remote's actual
+  host instead of a hard-coded `github.com`.  `git://` is no longer an
+  accepted `repo_url` scheme; whitespace/control characters are rejected.
+
+### Fixed
+
+- `save_profiles()` writes the voiceprint DB atomically (same-directory
+  temp file + fsync + `os.replace`, mode preserved).  vezir SIGKILLs the
+  millet process group on a watchdog timeout; a kill mid-`write_text()`
+  left a truncated `speaker_profiles.json` — a running average with no
+  provenance, so unrecoverable.
+
+### Tests
+
+- 20 new in `tests/test_sync_hardening.py` (origin check, crafted
+  `session.json` end-to-end against a local bare repo, URL policy, host
+  parsing, non-interactive git), 3 in `tests/test_voiceprint_save_atomic.py`,
+  40 parametrized injection cases in `tests/test_frontmatter.py`, and the
+  fallback-chain tests now assert venice/near are opt-in.  The shared
+  local-git fixtures moved to `tests/conftest.py`.  CI subset: 344 → 457.
 
 ## v0.21.7 — distrust the leaked eMudhra intermediates
 
