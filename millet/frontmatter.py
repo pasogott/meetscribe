@@ -404,7 +404,16 @@ def validate_frontmatter(fm: dict[str, Any]) -> None:
 # determinism in tests, and uses block style throughout for readability.
 
 _SAFE_YAML_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_NEEDS_QUOTING = re.compile(r"[:#\[\]\{\},&\*!\|>'\"%@`\\]|^\s|\s$|^[-?]\s")
+# Control characters (incl. CR/LF/TAB, C1 controls, and the Unicode line/
+# paragraph separators YAML treats as line breaks) force quoting: a
+# participant name or LLM-emitted line containing "\n---\n" would otherwise
+# close the frontmatter block early or inject list items/keys (security
+# audit 2026-10-30, M-6).  The source of these strings is never trusted —
+# speaker names come from the label map, titles from session.json, and
+# topics/decisions/actions from the model.
+_NEEDS_QUOTING = re.compile(
+    r"[:#\[\]\{\},&\*!\|>'\"%@`\\\x00-\x1f\x7f-\x9f\u2028\u2029\ufeff]|^\s|\s$|^[-?]\s"
+)
 
 
 def _yaml_scalar(value: Any) -> str:
@@ -440,10 +449,69 @@ def _yaml_scalar(value: Any) -> str:
     raise TypeError(f"cannot render {type(value).__name__} as YAML scalar")
 
 
+_YAML_ESCAPES = {
+    "\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t",
+    "\x00": "\\0", "\x07": "\\a", "\x08": "\\b", "\x0b": "\\v", "\x0c": "\\f",
+    "\x1b": "\\e", "\x85": "\\N", "\xa0": "\\_", "\u2028": "\\L", "\u2029": "\\P",
+}
+
+
 def _yaml_quote(s: str) -> str:
-    """Double-quote a string with minimal escaping for YAML."""
-    escaped = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    return f'"{escaped}"'
+    """Double-quote a string as a single YAML scalar.
+
+    Every control character is escaped (named escape where YAML has one,
+    ``\\xNN`` otherwise) so the emitted value is always exactly one logical
+    line, whatever the input contained.
+    """
+    out: list[str] = []
+    for ch in s:
+        esc = _YAML_ESCAPES.get(ch)
+        if esc is not None:
+            out.append(esc)
+        elif ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+_YAML_UNESCAPES = {v[1:]: k for k, v in _YAML_ESCAPES.items()}
+
+
+def _yaml_unquote(inner: str) -> str:
+    """Inverse of :func:`_yaml_quote` for the fallback parser.
+
+    Single left-to-right pass, so ``\\\\n`` (an escaped backslash followed by
+    ``n``) decodes to a backslash + ``n`` and never to a newline — the old
+    chained ``.replace()`` decoder got that wrong.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        nxt = inner[i + 1]
+        if nxt == "x" and i + 3 < n:
+            try:
+                out.append(chr(int(inner[i + 2:i + 4], 16)))
+                i += 4
+                continue
+            except ValueError:
+                pass
+        if nxt == "u" and i + 5 < n:
+            try:
+                out.append(chr(int(inner[i + 2:i + 6], 16)))
+                i += 6
+                continue
+            except ValueError:
+                pass
+        out.append(_YAML_UNESCAPES.get(nxt, nxt))
+        i += 2
+    return "".join(out)
 
 
 def _render_yaml(data: Any, indent: int = 0) -> str:
@@ -612,8 +680,7 @@ def _parse_simple_yaml(text: str) -> dict[str, Any] | None:
         if s == "{}":
             return {}
         if s.startswith('"') and s.endswith('"') and len(s) >= 2:
-            inner = s[1:-1]
-            return inner.replace('\\"', '"').replace("\\\\", "\\").replace("\\n", "\n")
+            return _yaml_unquote(s[1:-1])
         # int?
         try:
             return int(s)

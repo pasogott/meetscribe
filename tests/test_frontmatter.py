@@ -280,6 +280,95 @@ class TestYamlRoundtrip:
         assert parsed["title"] == 'He said "hi" — and left'
 
 
+# ─── Injection resistance (security audit 2026-10-30, M-6) ─────────────────
+
+_INJECTIONS = [
+    "Alice\n---\n# injected heading",
+    "Bob\n- injected: item",
+    "Carol\nevil_key: evil_value",
+    "Dave\r\n---\r\n",
+    "tab\there",
+    "nul\x00byte",
+    "bell\x07 and esc\x1b[31m",
+    "line\u2028separator",
+    "para\u2029separator",
+    "nel\x85next",
+    "trailing backslash\\",
+    "backslash-n literal \\n stays text",
+    "plain ünïcödé — ok",
+]
+
+
+class TestFrontmatterInjection:
+    @pytest.mark.parametrize("name", _INJECTIONS)
+    def test_participant_name_cannot_break_the_block(self, name):
+        ctx = FrontmatterContext(
+            title="T",
+            transcript_speakers=[name],
+            speaker_channels={name: "system"},
+        )
+        fm = build_frontmatter(None, ctx)
+        block = render_frontmatter_block(fm)
+        # The block is exactly one YAML document: opening and closing fence,
+        # and no raw line of the body equals a fence or starts a new top-level
+        # key/list item that we did not emit.
+        lines = block.splitlines()
+        assert lines[0] == "---" and lines[-1] == "---"
+        assert lines[1:-1].count("---") == 0
+        assert not any(line.startswith(("# injected", "evil_key:")) for line in lines)
+        assert not any("\x00" in line or "\x07" in line or "\x1b" in line for line in lines)
+        parsed, _ = parse_frontmatter_block(block)
+        assert parsed is not None
+        names = [p["name"] for p in parsed["participants"]]
+        assert names == [name]  # exact logical round-trip
+
+    @pytest.mark.parametrize("value", _INJECTIONS)
+    def test_llm_fields_round_trip_exactly(self, value):
+        ctx = FrontmatterContext(title=value)
+        extracted = {
+            "topics": [value],
+            "action_items": [{"task": value, "assignee": value}],
+            "decisions": [{"text": value, "topic": value}],
+        }
+        fm = build_frontmatter(extracted, ctx)
+        block = render_frontmatter_block(fm)
+        parsed, _ = parse_frontmatter_block(block)
+        assert parsed is not None
+        assert parsed["title"] == value
+        # Extracted fields are whitespace-stripped by the normalizers (that is
+        # pre-existing, not escaping); the logical content must survive exactly.
+        assert parsed["topics"] == [value.strip()]
+        assert parsed["action_items"][0]["task"] == value.strip()
+        assert parsed["decisions"][0]["text"] == value.strip()
+
+    @pytest.mark.parametrize("value", _INJECTIONS)
+    def test_fallback_parser_round_trips_too(self, value, monkeypatch):
+        """Without PyYAML the bespoke parser must decode the same escapes."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_yaml(name, *a, **k):
+            if name == "yaml":
+                raise ImportError("yaml disabled for test")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", no_yaml)
+        ctx = FrontmatterContext(title=value)
+        fm = build_frontmatter(None, ctx)
+        block = render_frontmatter_block(fm)
+        parsed, _ = parse_frontmatter_block(block)
+        assert parsed is not None
+        assert parsed["title"] == value
+
+    def test_participant_name_cannot_inject_key_via_yaml_safe_load(self):
+        name = "x\nschema_version: 999"
+        ctx = FrontmatterContext(title="T", transcript_speakers=[name])
+        fm = build_frontmatter(None, ctx)
+        parsed, _ = parse_frontmatter_block(render_frontmatter_block(fm))
+        assert parsed["schema_version"] == SCHEMA_VERSION
+
+
 # ─── context_from_transcript ───────────────────────────────────────────────
 
 
