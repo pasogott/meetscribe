@@ -388,6 +388,7 @@ _DNS_TIMEOUT = 10.0
 
 def _getaddrinfo_with_timeout(host: str, port: int) -> None:
     """Resolve in a child that subprocess.run kills on timeout."""
+    import socket
     import sys
 
     try:
@@ -409,7 +410,7 @@ def _getaddrinfo_with_timeout(host: str, port: int) -> None:
             f"DNS resolution for {host} timed out after {_DNS_TIMEOUT}s"
         ) from exc
     if result.returncode:
-        raise RuntimeError(f"DNS resolution for {host} failed: {result.stderr[:200]}")
+        raise socket.gaierror(f"DNS resolution for {host} failed: {result.stderr[:200]}")
 
 
 def _ssh_with_batch_mode(command: str) -> str:

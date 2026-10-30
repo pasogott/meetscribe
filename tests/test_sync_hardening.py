@@ -358,6 +358,18 @@ def test_run_network_bounds_hanging_dns(monkeypatch, tmp_path):
     assert time.monotonic() - t0 < 1
 
 
+def test_dns_resolution_failure_is_retryable(monkeypatch):
+    import socket
+
+    monkeypatch.setattr(
+        sync.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, "", "NXDOMAIN"),
+    )
+    with pytest.raises(socket.gaierror):
+        sync._getaddrinfo_with_timeout("missing.example", 443)
+
+
 def test_run_network_gates_on_remote_host_not_github(monkeypatch, tmp_path):
     import sys
 
