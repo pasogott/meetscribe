@@ -290,7 +290,7 @@ class TestBillingClassification:
             sm._summarize_attested_oai("venice", "sys", "user", cfg)
 
 
-# ── 0.22.0 (audit M-2): NEAR per-response signature binding ─────────────────
+# ── 0.22.0 (audit M-2): NEAR provider-key response signatures ───────────────
 
 
 def _secp_keypair():
@@ -395,10 +395,9 @@ class TestResponseSignature:
                 signing_public_key=check_pub,
             )
 
-    def test_near_path_labels_response_signed_and_fails_closed(self, monkeypatch):
-        """End-to-end through _summarize_attested_oai with a fake OpenAI
-        client: a verified signature yields the response-signed label; a
-        bad one raises AttestationError (→ fallback loop, never saved)."""
+    def test_near_path_labels_provider_signed_and_fails_closed(self, monkeypatch):
+        """A valid signature earns only the honest provider-key label; a bad
+        one raises AttestationError (→ fallback loop, never saved)."""
         import hashlib
         import sys
         import types
@@ -455,7 +454,10 @@ class TestResponseSignature:
 
         cfg = sm.SummaryConfig(backend="near", model="z-ai/glm-5.3-flash")
         out = sm._summarize_attested_oai("near", "sys", "user", cfg)
-        assert out.model == "z-ai/glm-5.3-flash (TEE, response-signed)"
+        assert out.model == "z-ai/glm-5.3-flash (response-signed, provider-key)"
+        assert "TEE" not in out.model
+        assert "enclave" not in out.model
+        assert "attested" not in out.model
 
         state["sig_text"] = good_text[:-1] + ("0" if good_text[-1] != "0" else "1")
         with pytest.raises(att.AttestationError):

@@ -1,15 +1,16 @@
 """First-party TEE attestation checks for the OpenAI-compatible fallback backends.
 
 The Tinfoil backend verifies its enclave through the Tinfoil SDK.  The generic
-attested backends (venice, near) talk plain OpenAI-compatible HTTP, so before we
-trust one enough to badge a summary "attested" we verify the enclave ourselves.
+backends (venice, near) talk plain OpenAI-compatible HTTP; we verify their
+provider-supplied NVIDIA GPU evidence ourselves, but not their enclave channel,
+so these checks do not justify an "attested" badge.
 
 Both providers expose the SAME Phala/dstack-style attestation (verified live
 2026-09-15): a GET returns a document containing an opaque ``nvidia_payload``
-(GPU evidence) plus the enclave's ``signing_address`` and the ``nonce`` we sent.
-The NVIDIA GPU evidence is NOT a ready JWT — it must be POSTed to NVIDIA's
-Remote Attestation Service (NRAS), which returns a signed Entity Attestation
-Token (EAT).  We then require, from that NVIDIA-signed EAT:
+(GPU evidence), a provider-reported ``signing_address``, and the ``nonce`` we
+sent.  The NVIDIA GPU evidence is NOT a ready JWT — it must be POSTed to
+NVIDIA's Remote Attestation Service (NRAS), which returns a signed Entity
+Attestation Token (EAT).  We then require, from that NVIDIA-signed EAT:
 
   1. ``x-nvidia-overall-att-result == True`` — NVIDIA vouches the GPU is a
      genuine Confidential-Computing device in a good state; and
@@ -26,28 +27,25 @@ Since 0.22.0 (security audit 2026-10-30, M-2) two more things are checked:
   4. for NEAR, the **per-response signature**: every completion can be
      fetched back from ``/v1/signature/{id}`` as
      ``"<model>:<sha256(request)>:<sha256(response)>"`` signed (EIP-191,
-     secp256k1) by the model enclave's ``signing_address`` — the same key the
-     attestation report binds into the TDX ``report_data``.  Verifying it
-     with the attested ``signing_public_key`` proves the bytes we received
-     were produced inside the attested enclave for the bytes we sent, not
-     by the gateway or anything in between.  This is output integrity and
-     origin binding; it is still NOT proof that the gateway's TLS
-     termination point cannot read the request, which is why NEAR stays
-     opt-in and is recorded as "(TEE, response-signed)" rather than as a
-     Tinfoil-grade attestation.
+     secp256k1).  We verify it with the ``signing_public_key`` from the
+     provider's JSON and check that its ``signing_address`` is self-consistent.
+     This proves response integrity and origin under that provider-supplied
+     key.  It does NOT prove enclave origin: we have not verified that the key
+     is bound to TDX ``report_data``.  NEAR therefore stays opt-in and is
+     recorded as "(response-signed, provider-key)", not as an attested TEE.
 
 What we deliberately DO NOT re-derive is full Intel TDX quote validation
 (``intel_quote`` — MRTD/RTMR measurement policy + the Intel DCAP certificate
-chain / TCB collateral).  That is a large, security-critical crypto pipeline; a
-subtly wrong reimplementation would mint a *false* "attested" badge, worse than
-none.  Providers publish reference verifiers for it (NEAR's
-nearai-cloud-verifier; Phala's dcap-qvl).  We verify the NVIDIA-signed GPU
-evidence + nonce freshness ourselves and treat deep TDX-quote validation as a
-delegated ceiling.
+chain / TCB collateral), including the signing-key binding to ``report_data``.
+That is a large, security-critical crypto pipeline; a subtly wrong
+reimplementation would mint a *false* "attested" badge, worse than none.
+Providers publish reference verifiers for it (NEAR's nearai-cloud-verifier;
+Phala's dcap-qvl).  Full cryptographic channel binding and TDX quote /
+``report_data`` validation remain open follow-ups.
 
-# ponytail: verifies NRAS GPU EAT (overall result + nonce) only; full Intel TDX
-#   quote/DCAP validation is the ceiling — wire dcap-qvl or a provider reference
-#   verifier here if TDX-level assurance is ever required, don't hand-roll DCAP.
+# ponytail: verifies NRAS GPU EAT (overall result + nonce) and provider-key
+#   response signatures only; full Intel TDX quote/DCAP and channel binding are
+#   the ceiling — use a provider reference verifier if that assurance is needed.
 
 A failure here is loud: the caller (summarize) treats it like the Tinfoil
 attestation error — fall through to the next backend, never save an unverified
@@ -225,7 +223,7 @@ def verify_attestation(
     api_key: str | None = None,
     nonce: str | None = None,
 ) -> dict | None:
-    """Fetch and verify a backend's enclave attestation. Raise on any failure.
+    """Fetch a provider report and verify its NVIDIA GPU evidence.
 
     ``attestation_url`` must accept a ``nonce`` query parameter (Venice:
     ``/api/v1/tee/attestation?model=<e2ee-id>&nonce=...``; NEAR:
@@ -233,9 +231,10 @@ def verify_attestation(
     a fresh nonce, pull the ``nvidia_payload`` from the response, POST it to
     NRAS, and require an overall-PASS EAT that binds our nonce.
 
-    Returns the model enclave's signing key (``{"signing_address",
-    "signing_public_key"}``) when the report carries one (NEAR), else None;
-    raises :class:`AttestationError` on any failure.
+    Returns the provider-reported signing key (``{"signing_address",
+    "signing_public_key"}``) when the report carries one (NEAR), else None.
+    The key is checked for internal consistency, not bound to a verified TDX
+    quote.  Raises :class:`AttestationError` on any failure.
     """
     nonce = nonce or new_nonce()
     sep = "&" if "?" in attestation_url else "?"
@@ -264,17 +263,18 @@ def verify_attestation(
         )
 
     _verify_nras(payload, nonce)
-    logger.info("attestation verified for %s (NVIDIA NRAS GPU + nonce)", attestation_url)
+    logger.info("provider GPU evidence verified for %s (NVIDIA NRAS + nonce)", attestation_url)
     return _signing_key_from_doc(doc, nonce)
 
 
 def _signing_key_from_doc(doc: dict, nonce: str) -> dict | None:
-    """Extract the model enclave's signing key from a NEAR-style report.
+    """Extract a provider-reported signing key from a NEAR-style report.
 
     Returns ``{"signing_address", "signing_public_key"}`` (lower-case hex,
     no ``0x``) when present and self-consistent — the address must equal
     ``keccak256(pubkey)[-20:]`` and the report's ``request_nonce`` must be
-    ours — else None (Venice's doc carries no per-model key).
+    ours — else None (Venice's doc carries no per-model key).  This does not
+    verify that either field is bound to a TDX quote.
     """
     atts = doc.get("model_attestations")
     if not (isinstance(atts, list) and atts and isinstance(atts[0], dict)):
@@ -307,15 +307,15 @@ def verify_response_signature(
     response_bytes: bytes,
     signing_public_key: str,
 ) -> None:
-    """Prove a completion was produced by the attested model enclave.
+    """Verify response integrity and origin under a provider-supplied key.
 
     NEAR exposes ``/v1/signature/{chat_id}`` returning
     ``text = "<model>:<sha256(request)>:<sha256(response)>"`` and an
-    Ethereum-style (EIP-191 personal-sign, secp256k1) ``signature`` by the
-    enclave's key.  We recompute both hashes from the exact bytes we sent
-    and received, require ``text`` to match, and verify the signature with
-    the ``signing_public_key`` the attestation report bound into the TDX
-    ``report_data`` (0.22.0, audit M-2).  Raises :class:`AttestationError`.
+    Ethereum-style (EIP-191 personal-sign, secp256k1) ``signature``.  We
+    recompute both hashes from the exact bytes we sent and received, require
+    ``text`` to match, and verify with the provider JSON's self-consistent
+    ``signing_public_key``.  No verified TDX ``report_data`` binding means
+    this does not prove enclave origin.  Raises :class:`AttestationError`.
     """
     import hashlib
 
@@ -357,7 +357,7 @@ def verify_response_signature(
     addr = str(sig_doc.get("signing_address", "")).lower().removeprefix("0x")
     pub = signing_public_key.lower().removeprefix("0x")
     if addr and keccak256(bytes.fromhex(pub))[-20:].hex() != addr:
-        raise AttestationError("response was signed by a key other than the attested one")
+        raise AttestationError("response was signed by a key other than the provider-supplied one")
 
     raw = bytes.fromhex(sig_hex)
     r_int, s_int = int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:64], "big")
@@ -372,7 +372,7 @@ def verify_response_signature(
         )
     except (InvalidSignature, ValueError) as e:
         raise AttestationError(f"response signature does not verify: {e}") from e
-    logger.info("response signature verified against the attested enclave key (%s)", model)
+    logger.info("response signature verified against the provider-supplied key (%s)", model)
 
 
 if __name__ == "__main__":

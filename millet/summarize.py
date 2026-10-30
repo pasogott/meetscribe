@@ -1817,7 +1817,7 @@ def _summarize_attested_oai(
         attempt += 1
         try:
             # with_raw_response: we need the exact bytes sent and received to
-            # check the enclave's per-response signature (audit M-2).
+            # check the provider-key per-response signature (audit M-2).
             raw = client.chat.completions.with_raw_response.create(
                 model=model,
                 messages=[
@@ -1857,13 +1857,10 @@ def _summarize_attested_oai(
     if not content_out:
         raise RuntimeError(f"{backend} returned an empty response for model {model!r}.")
 
-    # Response-origin binding (0.22.0, audit M-2): NEAR signs
-    # "<model>:<sha256(request)>:<sha256(response)>" with the model enclave's
-    # key, which the attestation report tied into the TDX report_data.  A
-    # verified signature proves the bytes we hold were produced inside the
-    # attested enclave for the bytes we sent.  It does NOT prove the
-    # gateway's TLS termination point cannot read the request, so the
-    # label stays short of Tinfoil's "(TEE)".
+    # Response integrity under a provider-supplied key (audit M-2): NEAR signs
+    # "<model>:<sha256(request)>:<sha256(response)>".  The provider JSON's key
+    # is self-consistent but is not bound to a verified TDX report_data, so a
+    # valid signature does not prove enclave origin.  Keep the label explicit.
     if signature_url_tpl and signing_key:
         chat_id = getattr(response, "id", None)
         if not chat_id:
@@ -1876,7 +1873,7 @@ def _summarize_attested_oai(
             response_bytes=http_response.content,
             signing_public_key=signing_key["signing_public_key"],
         )
-        label = f"{model} (TEE, response-signed)"
+        label = f"{model} (response-signed, provider-key)"
     else:
         # No per-response signature on this provider: the attestation is a
         # separate document with no link to the HTTPS peer.  Say so.

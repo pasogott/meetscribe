@@ -581,15 +581,18 @@ next one in the fallback chain: **tinfoil → ollama**.  Both destinations are
 private, so unlike the pre-0.19.0 chain this cannot silently downgrade
 confidentiality — only quality.
 
-Two further TEE providers, `venice` and `near`, are registered but
-**opt-in only** (`MILLET_SUMMARY_FALLBACK_ORDER=tinfoil,venice,near,ollama`
-or `--summary-backend venice`).  millet verifies their NVIDIA NRAS GPU
-evidence and a freshness nonce before sending a prompt, but — unlike the
-Tinfoil SDK — nothing binds that attestation to the HTTPS peer that receives
-the transcript, and the NRAS signature itself is not verified.  They were in
-the default chain from 0.21.0 to 0.21.7; since 0.21.8 you have to choose
-them, and their provenance is recorded as `(TEE, transport unbound)` so no
-downstream badge mistakes them for a Tinfoil-grade attestation.
+Two further providers, `venice` and `near`, are registered but **opt-in only**
+(`MILLET_SUMMARY_FALLBACK_ORDER=tinfoil,venice,near,ollama` or
+`--summary-backend venice`).  millet verifies their NVIDIA NRAS EAT signature,
+GPU evidence, and a freshness nonce before sending a prompt, but — unlike the
+Tinfoil SDK — nothing binds that evidence to the HTTPS peer that receives the
+transcript.  They were in the default chain from 0.21.0 to 0.21.7; since
+0.21.8 you have to choose them.  Venice provenance remains
+`(TEE, transport unbound)`.  NEAR also verifies response signatures against a
+self-consistent key supplied in provider JSON and records
+`(response-signed, provider-key)`.  This establishes response integrity and
+origin under that key only, not enclave origin: full cryptographic channel
+binding and TDX quote/`report_data` verification remain open.
 
 Two narrower safety nets sit inside that:
 

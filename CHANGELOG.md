@@ -11,20 +11,20 @@
   published JWKS (`/.well-known/jwks.json`, cached, one re-fetch on an
   unknown `kid`), algorithm pinned to ES384, issuer pinned, `exp`
   required.  Applies to both venice and near.
-- **NEAR responses are bound to the attested enclave.**  NEAR signs every
-  completion — `"<model>:<sha256(request)>:<sha256(response)>"`, EIP-191
-  secp256k1 — with the model enclave's key, the same key the attestation
-  report ties into the TDX `report_data` (`signing_address ==
-  keccak256(pubkey)[-20:]`, checked).  millet now sends the request via
-  the SDK's raw-response path, fetches `/v1/signature/{id}`, recomputes
-  both hashes from the exact bytes sent and received, and verifies the
-  signature with the attested public key.  A mismatch raises
-  `AttestationError` (fallback loop, never saved).  Verified live
-  2026-10-30.  The provenance reads `<model> (TEE, response-signed)`.
-  This proves origin and integrity of the output; it still does not
-  prove the gateway's TLS termination point cannot read the request, so
-  NEAR remains opt-in and short of Tinfoil's `(TEE)`.  Venice keeps
-  `(TEE, transport unbound)` — it offers no per-response signature.
+- **NEAR response signatures are verified against a provider-supplied key.**
+  millet sends the request via the SDK's raw-response path, fetches
+  `/v1/signature/{id}`, recomputes both hashes from the exact bytes sent and
+  received, and verifies `"<model>:<sha256(request)>:<sha256(response)>"`
+  (EIP-191 secp256k1).  It also checks `signing_address ==
+  keccak256(pubkey)[-20:]`.  A mismatch raises `AttestationError` (fallback
+  loop, never saved).  The key comes from provider JSON and is only
+  self-consistent: millet does not verify a TDX `report_data` binding.  This
+  proves response integrity and origin under that key, not enclave origin.
+  New provenance reads `<model> (response-signed, provider-key)`; clients
+  retain compatibility with the earlier `<model> (TEE, response-signed)`.
+  Full cryptographic channel and quote/key binding remain open.  NEAR remains
+  opt-in.  Venice keeps `(TEE, transport unbound)` — it offers no per-response
+  signature.
 - New `millet/keccak.py`: pure-Python Keccak-256 (Ethereum padding, not
   `sha3_256`), known-answer-checked on import, for the two checks above.
 
@@ -35,7 +35,8 @@
   kid / wrong issuer / expired all rejected; keccak KATs; signing-key
   extraction + address check; valid signature verifies; request /
   response / model / key / signature tampering each detected; end-to-end
-  NEAR path yields the response-signed label and fails closed.
+  NEAR path yields only the provider-key response-signed label and fails
+  closed.
 
 ## v0.21.8 — security audit 2026-10-30 (sync hardening, honest attestation)
 

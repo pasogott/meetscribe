@@ -2,9 +2,10 @@
 which applies the 0x06 SHA-3 domain padding and yields different digests).
 
 Needed to check NEAR's per-response signatures (``millet.attestation``):
-the enclave signs with an Ethereum-style secp256k1 key, so the message is
-``keccak256("\\x19Ethereum Signed Message:\\n" + len + text)`` and the
-attested ``signing_address`` is ``keccak256(pubkey_xy)[-20:]``.  Pure
+the provider-reported signer uses an Ethereum-style secp256k1 key, so the
+message is ``keccak256("\\x19Ethereum Signed Message:\\n" + len + text)`` and
+the self-consistency check is ``signing_address == keccak256(pubkey_xy)[-20:]``.
+This does not establish an enclave key binding.  Pure
 Python on purpose — the inputs are a few hundred bytes, and pulling in
 pycryptodome / eth-hash for one digest is not worth a dependency.
 Self-checked against the known empty-input digest on import.
