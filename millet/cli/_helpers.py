@@ -87,7 +87,11 @@ def _generate_summary(
     def _cli_progress(msg: str) -> None:
         click.echo(f"  {msg}")
 
-    artifact = summary_template or "summary"
+    # The RESOLVED template (explicit arg > MILLET_SUMMARY_TEMPLATE, lowercased
+    # by SummaryConfig) drives the output name and the clips decision -- the
+    # raw argument is None when the template comes from the environment.
+    template = summary_config.template
+    artifact = template or "summary"
     click.echo(
         f"Generating meeting summary ({summary_config.model} via {summary_config.backend})..."
     )
@@ -104,6 +108,7 @@ def _generate_summary(
         path = result.save(out_dir, basename, frontmatter_context=fm_ctx, artifact=artifact)
         files[artifact] = path
         click.echo(f"  Summary generated in {result.elapsed_seconds:.1f}s")
+        _write_clips_if_template(result, transcript, out_dir, basename, files, template)
         return result
     except Exception as exc:
         click.echo(f"  Summary failed: {exc}", err=True)
@@ -115,6 +120,35 @@ def _generate_summary(
             # Re-raise so `meet transcribe` exits non-zero.
             raise
         return None
+
+
+def _write_clips_if_template(
+    summary_result, transcript, out_dir, basename, files, summary_template,
+    lang_suffix=None,
+):
+    """Write ``<basename>.clips.json`` for a ``video-clipping`` summary.
+
+    A failure here never fails the summary: the Markdown clip list already
+    exists, and the clips file can be rebuilt by a summary retry.
+    """
+    try:
+        from millet.clips import is_clips_template, write_clips_doc
+
+        if not is_clips_template(summary_template):
+            return None
+        path, doc = write_clips_doc(summary_result, transcript, out_dir, basename,
+                                    lang_suffix=lang_suffix)
+        click.echo(
+            f"  Clips: {len(doc['clips'])} kept, {len(doc['dropped'])} dropped "
+            f"-> {path.name}"
+        )
+        if doc.get("error"):
+            click.echo(f"  Clips: {doc['error']}", err=True)
+    except Exception as exc:
+        click.echo(f"  Clip extraction failed: {exc}", err=True)
+        return None
+    files["clips"] = path
+    return path
 
 
 def _generate_pdf(transcript, out_dir, basename, summary_result, files):
